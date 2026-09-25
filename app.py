@@ -1,7 +1,6 @@
 import io
 import re
 import zipfile
-import sqlite3
 import hashlib
 import secrets
 import os
@@ -13,6 +12,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from scipy.stats import linregress
 import streamlit as st
+from supabase import create_client, Client
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter, landscape
@@ -112,13 +112,34 @@ div[data-testid="stMetric"] {
 DEFAULT_SCHOOL = "EXCELLENCE SECONDARY SCHOOL"
 TERMS = ["y1t1", "y1t2", "y1t3", "y2t1", "y2t2", "y2t3"]
 
-LEARNING_DB = "school_learning.db"
-LEARNING_DIR = "learning_centre_files"
-PARENT_RESULTS_FILE = "school_results_current.xlsx"
 BACKUP_DIR = "system_backups"
-os.makedirs(LEARNING_DIR, exist_ok=True)
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
+
+# ============================================================
+# SUPABASE CLIENT
+# ============================================================
+# Credentials come from Streamlit Secrets (configured in the cloud dashboard).
+# Locally they can be placed in .streamlit/secrets.toml
+
+def get_supabase_client() -> Client:
+    url = st.secrets.get("SUPABASE_URL", "")
+    key = st.secrets.get("SUPABASE_KEY", "")
+    if not url or not key:
+        st.error(
+            "⚠️ Supabase credentials are not configured. "
+            "Please add SUPABASE_URL and SUPABASE_KEY to Streamlit Secrets."
+        )
+        st.stop()
+    return create_client(url, key)
+
+
+supabase = get_supabase_client()
+
+
+# ============================================================
+# PASSWORD HASHING
+# ============================================================
 
 def hash_password(password, salt=None):
     if salt is None:
@@ -136,314 +157,358 @@ def verify_password(password, stored):
     return hash_password(password, salt) == f"{salt}${hashed}"
 
 
-def db_conn():
-    conn = sqlite3.connect(LEARNING_DB)
-    conn.row_factory = sqlite3.Row
-    return conn
+# ============================================================
+# USER / AUTH FUNCTIONS (Supabase)
+# ============================================================
+
+def ensure_demo_users():
+    """Insert demo accounts if they don't exist yet (hashed passwords)."""
+    try:
+        for uname, pwd, role in [("teacher", "teacher123", "teacher"),
+                                  ("student", "student123", "student")]:
+            existing = supabase.table("users").select("username").eq("username", uname).execute()
+            if not existing.data:
+                supabase.table("users").insert({
+                    "username": uname,
+                    "password": hash_password(pwd),
+                    "role": role,
+                    "student_name": ""
+                }).execute()
+    except Exception:
+        pass
 
 
-def init_learning_db():
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("""CREATE TABLE IF NOT EXISTS users (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        password TEXT NOT NULL,
-        role TEXT NOT NULL,
-        student_name TEXT DEFAULT ''
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS parents (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        parent_name TEXT NOT NULL,
-        child_names TEXT DEFAULT '',
-        created_at TEXT NOT NULL
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS students (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE NOT NULL,
-        student_full_name TEXT NOT NULL,
-        created_at TEXT NOT NULL
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS materials (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        material_type TEXT NOT NULL,
-        subject TEXT DEFAULT '',
-        target_stream TEXT DEFAULT 'All Streams',
-        description TEXT DEFAULT '',
-        deadline TEXT DEFAULT '',
-        file_name TEXT DEFAULT '',
-        file_path TEXT DEFAULT '',
-        external_link TEXT DEFAULT '',
-        uploaded_by TEXT DEFAULT '',
-        created_at TEXT NOT NULL
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS submissions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        material_id INTEGER NOT NULL,
-        student_name TEXT NOT NULL,
-        file_name TEXT NOT NULL,
-        file_path TEXT NOT NULL,
-        submitted_at TEXT NOT NULL,
-        status TEXT DEFAULT 'Submitted',
-        teacher_feedback TEXT DEFAULT '',
-        UNIQUE(material_id, student_name)
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS quizzes (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        title TEXT NOT NULL,
-        subject TEXT DEFAULT '',
-        target_stream TEXT DEFAULT 'All Streams',
-        description TEXT DEFAULT '',
-        deadline TEXT DEFAULT '',
-        duration_minutes INTEGER DEFAULT 30,
-        created_by TEXT DEFAULT '',
-        created_at TEXT NOT NULL,
-        status TEXT DEFAULT 'Published'
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS quiz_questions (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        quiz_id INTEGER NOT NULL,
-        question_no INTEGER NOT NULL,
-        question_text TEXT NOT NULL,
-        question_type TEXT NOT NULL,
-        option_a TEXT DEFAULT '',
-        option_b TEXT DEFAULT '',
-        option_c TEXT DEFAULT '',
-        option_d TEXT DEFAULT '',
-        correct_answer TEXT DEFAULT '',
-        points REAL DEFAULT 1
-    )""")
-    cur.execute("""CREATE TABLE IF NOT EXISTS quiz_attempts (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        quiz_id INTEGER NOT NULL,
-        student_name TEXT NOT NULL,
-        started_at TEXT NOT NULL,
-        submitted_at TEXT NOT NULL,
-        answers_json TEXT DEFAULT '{}',
-        score REAL DEFAULT 0,
-        total_points REAL DEFAULT 0,
-        status TEXT DEFAULT 'Submitted',
-        teacher_feedback TEXT DEFAULT '',
-        UNIQUE(quiz_id, student_name)
-    )""")
-    cur.execute("INSERT OR IGNORE INTO users(username,password,role,student_name) VALUES(?,?,?,?)",
-                ("teacher", hash_password("teacher123"), "teacher", ""))
-    cur.execute("INSERT OR IGNORE INTO users(username,password,role,student_name) VALUES(?,?,?,?)",
-                ("student", hash_password("student123"), "student", ""))
-    conn.commit()
-    conn.close()
-
-
-init_learning_db()
+ensure_demo_users()
 
 
 def authenticate_user(username, password):
-    conn = db_conn()
-    row = conn.execute("SELECT * FROM users WHERE username=?", (username.strip(),)).fetchone()
-    conn.close()
-    if not row:
+    try:
+        result = supabase.table("users").select("*").eq("username", username.strip()).execute()
+        if not result.data:
+            return None
+        user = result.data[0]
+        if not verify_password(password, user.get("password", "")):
+            return None
+        # Upgrade legacy plain-text password to hashed
+        if "$" not in (user.get("password") or ""):
+            supabase.table("users").update({
+                "password": hash_password(password)
+            }).eq("username", user["username"]).execute()
+        return user
+    except Exception as e:
+        st.error(f"Database error during login: {e}")
         return None
-    user = dict(row)
-    if not verify_password(password, user["password"]):
-        return None
-    if "$" not in (user["password"] or ""):
-        conn = db_conn()
-        conn.execute("UPDATE users SET password=? WHERE username=?",
-                     (hash_password(password), user["username"]))
-        conn.commit()
-        conn.close()
-    return user
 
 
 def get_parent_profile(username):
-    conn = db_conn()
-    row = conn.execute("SELECT * FROM parents WHERE username=?", (username.strip(),)).fetchone()
-    conn.close()
-    return dict(row) if row else None
+    try:
+        result = supabase.table("parents").select("*").eq("username", username.strip()).execute()
+        return result.data[0] if result.data else None
+    except Exception:
+        return None
 
 
 def get_student_profile(username):
-    conn = db_conn()
-    row = conn.execute("SELECT * FROM students WHERE username=?", (username.strip(),)).fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def save_results_for_parent_access(raw_df, filename="school_results_current.xlsx"):
     try:
-        raw_df.to_excel(filename, index=False)
-        return True
+        result = supabase.table("students").select("*").eq("username", username.strip()).execute()
+        return result.data[0] if result.data else None
     except Exception:
+        return None
+
+
+def create_or_update_parent(username, parent_name, password, child_names):
+    hashed = hash_password(password)
+    # users row
+    existing = supabase.table("users").select("username").eq("username", username).execute()
+    if existing.data:
+        supabase.table("users").update({
+            "password": hashed, "role": "parent", "student_name": ""
+        }).eq("username", username).execute()
+    else:
+        supabase.table("users").insert({
+            "username": username, "password": hashed,
+            "role": "parent", "student_name": ""
+        }).execute()
+    # parents row
+    existing_p = supabase.table("parents").select("username").eq("username", username).execute()
+    if existing_p.data:
+        supabase.table("parents").update({
+            "parent_name": parent_name, "child_names": child_names
+        }).eq("username", username).execute()
+    else:
+        supabase.table("parents").insert({
+            "username": username,
+            "parent_name": parent_name,
+            "child_names": child_names,
+            "created_at": datetime.now().isoformat()
+        }).execute()
+
+
+def create_or_update_student(username, student_full_name, password):
+    hashed = hash_password(password)
+    existing = supabase.table("users").select("username").eq("username", username).execute()
+    if existing.data:
+        supabase.table("users").update({
+            "password": hashed, "role": "student",
+            "student_name": student_full_name
+        }).eq("username", username).execute()
+    else:
+        supabase.table("users").insert({
+            "username": username, "password": hashed,
+            "role": "student", "student_name": student_full_name
+        }).execute()
+    existing_s = supabase.table("students").select("username").eq("username", username).execute()
+    if existing_s.data:
+        supabase.table("students").update({
+            "student_full_name": student_full_name
+        }).eq("username", username).execute()
+    else:
+        supabase.table("students").insert({
+            "username": username,
+            "student_full_name": student_full_name,
+            "created_at": datetime.now().isoformat()
+        }).execute()
+
+
+def change_user_password(username, new_password):
+    supabase.table("users").update({
+        "password": hash_password(new_password)
+    }).eq("username", username).execute()
+
+
+# ============================================================
+# RESULTS STORE (replaces the local xlsx file)
+# ============================================================
+
+def save_results_store(raw_df):
+    try:
+        records = raw_df.fillna("").to_dict(orient="records")
+        data_json = json.dumps(records, default=str)
+        existing = supabase.table("results_store").select("id").eq("name", "current").execute()
+        if existing.data:
+            supabase.table("results_store").update({
+                "data_json": data_json,
+                "updated_at": datetime.now().isoformat()
+            }).eq("name", "current").execute()
+        else:
+            supabase.table("results_store").insert({
+                "name": "current",
+                "data_json": data_json,
+                "updated_at": datetime.now().isoformat()
+            }).execute()
+        st.success("✅ Saved to Supabase")
+        return True
+    except Exception as e:
+        st.error(f"❌ CLOUD SAVE FAILED: {e}")
+        import traceback
+        st.code(traceback.format_exc())
         return False
 
 
-def load_persisted_parent_results():
-    if not os.path.exists(PARENT_RESULTS_FILE):
-        return None
+def load_results_store():
     try:
-        return pd.read_excel(PARENT_RESULTS_FILE)
+        result = supabase.table("results_store").select("data_json").eq("name", "current").execute()
+        if not result.data:
+            return None
+        records = json.loads(result.data[0]["data_json"])
+        return pd.DataFrame(records)
     except Exception:
         return None
 
 
-def add_material(title, material_type, subject, target_stream, description, deadline,
-                 file_name, file_path, external_link, uploaded_by):
-    conn = db_conn()
-    conn.execute("""INSERT INTO materials
-        (title,material_type,subject,target_stream,description,deadline,file_name,file_path,external_link,uploaded_by,created_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
-        (title, material_type, subject, target_stream, description, deadline,
-         file_name, file_path, external_link, uploaded_by,
-         datetime.now().strftime("%Y-%m-%d %H:%M")))
-    conn.commit()
-    conn.close()
+# ============================================================
+# LEARNING CENTRE (Supabase)
+# ============================================================
+
+def add_material(title, material_type, subject, target_stream, description,
+                 deadline, file_name, file_path, external_link, uploaded_by):
+    supabase.table("materials").insert({
+        "title": title,
+        "material_type": material_type,
+        "subject": subject,
+        "target_stream": target_stream,
+        "description": description,
+        "deadline": deadline,
+        "file_name": file_name,
+        "file_path": file_path,
+        "external_link": external_link,
+        "uploaded_by": uploaded_by,
+        "created_at": datetime.now().isoformat()
+    }).execute()
 
 
 def get_materials():
-    conn = db_conn()
-    rows = conn.execute("SELECT * FROM materials ORDER BY id DESC").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        result = supabase.table("materials").select("*").order("id", desc=True).execute()
+        return result.data
+    except Exception:
+        return []
 
 
-def save_submission(material_id, student_name, uploaded_file):
-    safe_student = re.sub(r"[^A-Za-z0-9_-]+", "_", student_name).strip("_") or "student"
-    folder = os.path.join(LEARNING_DIR, "submissions", safe_student)
-    os.makedirs(folder, exist_ok=True)
+def save_submission(material_id, student_name, uploaded_file, file_path):
     safe_file = re.sub(r"[^A-Za-z0-9._-]+", "_", uploaded_file.name)
-    path = os.path.join(folder, safe_file)
-    with open(path, "wb") as f:
-        f.write(uploaded_file.getbuffer())
-    conn = db_conn()
-    conn.execute("""INSERT INTO submissions(material_id,student_name,file_name,file_path,submitted_at,status)
-        VALUES(?,?,?,?,?,?) ON CONFLICT(material_id,student_name) DO UPDATE SET
-        file_name=excluded.file_name,file_path=excluded.file_path,submitted_at=excluded.submitted_at,status='Resubmitted'""",
-        (material_id, student_name, safe_file, path,
-         datetime.now().strftime("%Y-%m-%d %H:%M"), "Submitted"))
-    conn.commit()
-    conn.close()
+    existing = supabase.table("submissions").select("id").eq("material_id", material_id).eq("student_name", student_name).execute()
+    payload = {
+        "material_id": material_id,
+        "student_name": student_name,
+        "file_name": safe_file,
+        "file_path": file_path,
+        "submitted_at": datetime.now().isoformat(),
+        "status": "Submitted"
+    }
+    if existing.data:
+        supabase.table("submissions").update({
+            "file_name": safe_file,
+            "file_path": file_path,
+            "submitted_at": datetime.now().isoformat(),
+            "status": "Resubmitted"
+        }).eq("id", existing.data[0]["id"]).execute()
+    else:
+        supabase.table("submissions").insert(payload).execute()
 
 
 def get_submissions(material_id=None, student_name=None):
-    conn = db_conn()
-    q = "SELECT s.*,m.title,m.subject FROM submissions s JOIN materials m ON s.material_id=m.id"
-    params = []
-    clauses = []
-    if material_id is not None:
-        clauses.append("s.material_id=?")
-        params.append(material_id)
-    if student_name:
-        clauses.append("s.student_name=?")
-        params.append(student_name)
-    if clauses:
-        q += " WHERE " + " AND ".join(clauses)
-    q += " ORDER BY s.id DESC"
-    rows = conn.execute(q, params).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        query = supabase.table("submissions").select("*")
+        if material_id is not None:
+            query = query.eq("material_id", material_id)
+        if student_name:
+            query = query.eq("student_name", student_name)
+        result = query.order("id", desc=True).execute()
+        rows = result.data or []
+        # Attach material title/subject
+        for r in rows:
+            mat = supabase.table("materials").select("title,subject").eq("id", r["material_id"]).execute()
+            if mat.data:
+                r["title"] = mat.data[0]["title"]
+                r["subject"] = mat.data[0].get("subject", "")
+        return rows
+    except Exception:
+        return []
 
 
 def delete_material(material_id):
-    conn = db_conn()
-    row = conn.execute("SELECT file_path FROM materials WHERE id=?", (material_id,)).fetchone()
-    conn.execute("DELETE FROM materials WHERE id=?", (material_id,))
-    conn.execute("DELETE FROM submissions WHERE material_id=?", (material_id,))
-    conn.commit()
-    conn.close()
-    if row and row[0] and os.path.exists(row[0]):
-        try:
-            os.remove(row[0])
-        except OSError:
-            pass
+    try:
+        supabase.table("submissions").delete().eq("material_id", material_id).execute()
+        supabase.table("materials").delete().eq("id", material_id).execute()
+    except Exception:
+        pass
 
 
-def add_quiz(title, subject, target_stream, description, deadline, duration_minutes, created_by, questions):
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("""INSERT INTO quizzes(title,subject,target_stream,description,deadline,duration_minutes,created_by,created_at)
-                   VALUES(?,?,?,?,?,?,?,?)""",
-                (title, subject, target_stream, description, deadline, int(duration_minutes),
-                 created_by, datetime.now().strftime("%Y-%m-%d %H:%M")))
-    quiz_id = cur.lastrowid
+# ============================================================
+# QUIZZES (Supabase)
+# ============================================================
+
+def add_quiz(title, subject, target_stream, description, deadline,
+             duration_minutes, created_by, questions):
+    result = supabase.table("quizzes").insert({
+        "title": title,
+        "subject": subject,
+        "target_stream": target_stream,
+        "description": description,
+        "deadline": deadline,
+        "duration_minutes": int(duration_minutes),
+        "created_by": created_by,
+        "created_at": datetime.now().isoformat(),
+        "status": "Published"
+    }).execute()
+    quiz_id = result.data[0]["id"]
     for i, q in enumerate(questions, 1):
-        cur.execute("""INSERT INTO quiz_questions
-            (quiz_id,question_no,question_text,question_type,option_a,option_b,option_c,option_d,correct_answer,points)
-            VALUES(?,?,?,?,?,?,?,?,?,?)""",
-            (quiz_id, i, q['text'], q['type'], q.get('a', ''), q.get('b', ''),
-             q.get('c', ''), q.get('d', ''), q.get('correct', ''), float(q.get('points', 1))))
-    conn.commit()
-    conn.close()
+        supabase.table("quiz_questions").insert({
+            "quiz_id": quiz_id,
+            "question_no": i,
+            "question_text": q["text"],
+            "question_type": q["type"],
+            "option_a": q.get("a", ""),
+            "option_b": q.get("b", ""),
+            "option_c": q.get("c", ""),
+            "option_d": q.get("d", ""),
+            "correct_answer": q.get("correct", ""),
+            "points": float(q.get("points", 1))
+        }).execute()
     return quiz_id
 
 
 def get_quizzes():
-    conn = db_conn()
-    rows = conn.execute("SELECT * FROM quizzes ORDER BY id DESC").fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        result = supabase.table("quizzes").select("*").order("id", desc=True).execute()
+        return result.data
+    except Exception:
+        return []
 
 
 def get_quiz_questions(quiz_id):
-    conn = db_conn()
-    rows = conn.execute("SELECT * FROM quiz_questions WHERE quiz_id=? ORDER BY question_no", (quiz_id,)).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        result = supabase.table("quiz_questions").select("*").eq("quiz_id", quiz_id).order("question_no").execute()
+        return result.data
+    except Exception:
+        return []
 
 
 def get_attempts(quiz_id=None, student_name=None):
-    conn = db_conn()
-    q = "SELECT a.*,q.title,q.subject FROM quiz_attempts a JOIN quizzes q ON a.quiz_id=q.id"
-    params = []
-    clauses = []
-    if quiz_id is not None:
-        clauses.append("a.quiz_id=?")
-        params.append(quiz_id)
-    if student_name:
-        clauses.append("a.student_name=?")
-        params.append(student_name)
-    if clauses:
-        q += " WHERE " + " AND ".join(clauses)
-    q += " ORDER BY a.id DESC"
-    rows = conn.execute(q, params).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
+    try:
+        query = supabase.table("quiz_attempts").select("*")
+        if quiz_id is not None:
+            query = query.eq("quiz_id", quiz_id)
+        if student_name:
+            query = query.eq("student_name", student_name)
+        result = query.order("id", desc=True).execute()
+        rows = result.data or []
+        for r in rows:
+            qz = supabase.table("quizzes").select("title,subject").eq("id", r["quiz_id"]).execute()
+            if qz.data:
+                r["title"] = qz.data[0]["title"]
+                r["subject"] = qz.data[0].get("subject", "")
+        return rows
+    except Exception:
+        return []
 
 
 def save_quiz_attempt(quiz_id, student_name, answers, score, total_points, status):
-    conn = db_conn()
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    conn.execute("""INSERT INTO quiz_attempts(quiz_id,student_name,started_at,submitted_at,answers_json,score,total_points,status)
-        VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(quiz_id,student_name) DO UPDATE SET
-        submitted_at=excluded.submitted_at,answers_json=excluded.answers_json,score=excluded.score,total_points=excluded.total_points,status=excluded.status""",
-        (quiz_id, student_name, now, now, json.dumps(answers),
-         float(score), float(total_points), status))
-    conn.commit()
-    conn.close()
+    existing = supabase.table("quiz_attempts").select("id").eq("quiz_id", quiz_id).eq("student_name", student_name).execute()
+    now = datetime.now().isoformat()
+    payload = {
+        "quiz_id": quiz_id,
+        "student_name": student_name,
+        "started_at": now,
+        "submitted_at": now,
+        "answers_json": json.dumps(answers),
+        "score": float(score),
+        "total_points": float(total_points),
+        "status": status
+    }
+    if existing.data:
+        supabase.table("quiz_attempts").update({
+            "submitted_at": now,
+            "answers_json": json.dumps(answers),
+            "score": float(score),
+            "total_points": float(total_points),
+            "status": status
+        }).eq("id", existing.data[0]["id"]).execute()
+    else:
+        supabase.table("quiz_attempts").insert(payload).execute()
 
 
 def update_quiz_feedback(attempt_id, feedback, status='Reviewed'):
-    conn = db_conn()
-    conn.execute("UPDATE quiz_attempts SET teacher_feedback=?,status=? WHERE id=?",
-                 (feedback.strip(), status, attempt_id))
-    conn.commit()
-    conn.close()
+    supabase.table("quiz_attempts").update({
+        "teacher_feedback": feedback.strip(),
+        "status": status
+    }).eq("id", attempt_id).execute()
 
 
 def delete_quiz(quiz_id):
-    conn = db_conn()
-    conn.execute("DELETE FROM quiz_questions WHERE quiz_id=?", (quiz_id,))
-    conn.execute("DELETE FROM quiz_attempts WHERE quiz_id=?", (quiz_id,))
-    conn.execute("DELETE FROM quizzes WHERE id=?", (quiz_id,))
-    conn.commit()
-    conn.close()
+    try:
+        supabase.table("quiz_questions").delete().eq("quiz_id", quiz_id).execute()
+        supabase.table("quiz_attempts").delete().eq("quiz_id", quiz_id).execute()
+        supabase.table("quizzes").delete().eq("id", quiz_id).execute()
+    except Exception:
+        pass
 
 
 def quiz_available_for_student(quiz, student_streams):
-    if quiz.get('target_stream') == 'All Streams' or not student_streams:
+    if quiz.get("target_stream") == "All Streams" or not student_streams:
         return True
-    return quiz.get('target_stream') in student_streams
+    return quiz.get("target_stream") in student_streams
 
 
 def quiz_grade(score, total):
@@ -451,20 +516,25 @@ def quiz_grade(score, total):
     return pct, grade(pct)
 
 
+# ============================================================
+# BACKUP
+# ============================================================
+
 def create_backup_zip():
+    """Create a ZIP with all Supabase tables dumped as JSON."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for f in [LEARNING_DB, PARENT_RESULTS_FILE]:
-            if os.path.exists(f):
-                z.write(f, arcname=os.path.basename(f))
-        for root, dirs, files in os.walk(LEARNING_DIR):
-            for file in files:
-                full = os.path.join(root, file)
-                rel = os.path.relpath(full, start=".")
-                z.write(full, arcname=rel)
+        for table in ["users", "parents", "students", "materials",
+                      "submissions", "quizzes", "quiz_questions",
+                      "quiz_attempts", "results_store"]:
+            try:
+                result = supabase.table(table).select("*").execute()
+                data = json.dumps(result.data, indent=2, default=str)
+                z.writestr(f"{table}.json", data)
+            except Exception:
+                pass
     buf.seek(0)
     return buf
-
 
 st.markdown("""
 <style>
@@ -545,8 +615,8 @@ def login_screen():
             else:
                 st.error("Incorrect username, password, or role.")
 
-        st.caption("Demo accounts: admin/admin123 • teacher/teacher123 • student/student123 • parent/parent123")
-        st.info("Teacher and student accounts use local credentials stored securely (hashed).")
+        st.caption("Demo accounts: admin/admin123 • teacher/teacher123 • student/student123")
+        st.info("Accounts are stored securely in Supabase with hashed passwords.")
 
     st.stop()
 
@@ -774,14 +844,6 @@ def figure_bytes(fig):
     plt.close(fig)
     buf.seek(0)
     return buf
-
-def school_contact_line():
-    parts = [
-        st.session_state.get("school_address", ""),
-        st.session_state.get("school_phone", ""),
-        st.session_state.get("school_email", ""),
-    ]
-    return " • ".join([p for p in parts if p])
 
 
 def pdf_school_header(story, school_name, styles, report_subtitle):
@@ -1038,7 +1100,6 @@ def generate_student_pdf(student, data, school_name, class_comment=None, report_
         principal_comment = "Congratulations on your progress. Continue working hard and remain disciplined."
 
     story = []
-
     pdf_school_header(
         story, school_name, styles,
         f"STUDENT REPORT CARD | {data['analysis_term'].upper()} | "
@@ -1198,7 +1259,6 @@ def generate_student_pdf(student, data, school_name, class_comment=None, report_
 
 def generate_all_student_pdfs(data, school_name):
     zip_buffer = io.BytesIO()
-
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for _, student in data["df"].iterrows():
             pdf = generate_student_pdf(student, data, school_name)
@@ -1210,7 +1270,6 @@ def generate_all_student_pdfs(data, school_name):
                 f"Student_{safe}_Report.pdf",
                 pdf.getvalue()
             )
-
     zip_buffer.seek(0)
     return zip_buffer
 
@@ -1247,13 +1306,25 @@ if uploaded:
                 st.session_state.raw_data = raw.copy()
                 st.session_state.data = prepare_data(raw, selected_term)
                 st.session_state.raw_file_name = uploaded.name
-                save_results_for_parent_access(raw)
-                st.session_state.parent_results_ready = True
+                save_results_store(raw)
                 st.rerun()
         else:
             st.sidebar.error("No term columns were detected.")
     except Exception as exc:
         st.sidebar.error(f"Excel error: {exc}")
+
+# Try to load saved results from Supabase before showing the welcome screen
+if st.session_state.data is None:
+    persisted = load_results_store()
+if persisted is not None and not persisted.empty:
+    try:
+        _, _, _, detected_terms, _ = detect_columns(persisted)
+        if detected_terms:
+            term_for_role = detected_terms[-1]
+            st.session_state.raw_data = persisted.copy()
+            st.session_state.data = prepare_data(persisted, term_for_role)
+    except Exception:
+        pass   
 
 if st.session_state.data is None and st.session_state.user_role not in ["student", "parent"]:
     st.markdown(
@@ -1282,31 +1353,22 @@ if st.session_state.data is None and st.session_state.user_role not in ["student
     st.write("4. Use the navigation menu to explore the system.")
     st.stop()
 
+# Parents and students read the latest saved results from Supabase
 
-if st.session_state.user_role == "parent" and st.session_state.data is None:
-    persisted = load_persisted_parent_results()
+if st.session_state.data is None:
+    persisted = load_results_store()
+    st.write(f"DEBUG: load_results_store returned: {type(persisted)} | is None: {persisted is None} | empty: {persisted.empty if persisted is not None else 'N/A'}")
     if persisted is not None and not persisted.empty:
         try:
             _, _, _, detected_terms, _ = detect_columns(persisted)
+            st.write(f"DEBUG: detected_terms = {detected_terms}")
             if detected_terms:
-                parent_term = detected_terms[-1]
+                term_for_role = detected_terms[-1]
                 st.session_state.raw_data = persisted.copy()
-                st.session_state.data = prepare_data(persisted, parent_term)
-        except Exception:
-            pass
-
-if st.session_state.user_role == "student" and st.session_state.data is None:
-    persisted = load_persisted_parent_results()
-    if persisted is not None and not persisted.empty:
-        try:
-            _, _, _, detected_terms, _ = detect_columns(persisted)
-            if detected_terms:
-                student_term = detected_terms[-1]
-                st.session_state.raw_data = persisted.copy()
-                st.session_state.data = prepare_data(persisted, student_term)
-        except Exception:
-            pass
-
+                st.session_state.data = prepare_data(persisted, term_for_role)
+                st.write("DEBUG: data loaded successfully")
+        except Exception as e:
+            st.error(f"DEBUG ERROR: {e}")
 if st.session_state.data is None and st.session_state.user_role in ["student", "parent"]:
     data = None
     df = pd.DataFrame()
@@ -1323,7 +1385,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.markdown(
-    f'<div class="app-subtitle">Academic Management System • V17 • {data["analysis_term"].upper() if data is not None else "Learning Centre"}</div>',
+    f'<div class="app-subtitle">Academic Management System • V18 Cloud • {data["analysis_term"].upper() if data is not None else "Learning Centre"}</div>',
     unsafe_allow_html=True
 )
 
@@ -1386,10 +1448,9 @@ if page == "Parent Portal":
     if not matched:
         st.warning(
             "The student name(s) linked to your account do not match any student "
-            "in the current results. Please contact the school administrator to correct the link."
+            "in the current results. Please contact the school administrator."
         )
         st.write("**Linked names on your account:** " + ", ".join(children_raw))
-        st.write("**Example student names in current results:** " + ", ".join(df[name_col].astype(str).head(5).tolist()))
         st.stop()
 
     if len(matched) > 1:
@@ -1482,7 +1543,7 @@ if page == "Parent Portal":
 
 
 # ============================================================
-# STUDENT DASHBOARD (read-only)
+# STUDENT DASHBOARD
 # ============================================================
 
 if page == "My Dashboard":
@@ -1793,7 +1854,7 @@ elif page == "Students":
 
 elif page == "Student Records":
     st.subheader("👥 Student Records & Data Management")
-    st.caption("Add, edit, remove and export student records without changing your original Excel file until you download the updated version.")
+    st.caption("Add, edit, remove and export student records. Changes are saved to the cloud.")
 
     raw_df = st.session_state.get("raw_data")
     if raw_df is None or raw_df.empty:
@@ -1854,8 +1915,8 @@ elif page == "Student Records":
                 working.loc[edit_idx, col] = val
             st.session_state.raw_data = working
             st.session_state.data = prepare_data(working, data["analysis_term"])
-            save_results_for_parent_access(working)
-            st.success(f"Updated {new_name.strip() or edit_name}. Rankings and analytics have been recalculated.")
+            save_results_store(working)
+            st.success(f"Updated {new_name.strip() or edit_name}. Rankings recalculated and saved to cloud.")
             st.rerun()
 
     with tab_add:
@@ -1886,26 +1947,26 @@ elif page == "Student Records":
                 working = pd.concat([working, pd.DataFrame([new_row])], ignore_index=True)
                 st.session_state.raw_data = working
                 st.session_state.data = prepare_data(working, data["analysis_term"])
-                save_results_for_parent_access(working)
-                st.success(f"Added {add_name.strip()} to {str(add_stream).upper()}.")
+                save_results_store(working)
+                st.success(f"Added {add_name.strip()} and saved to cloud.")
                 st.rerun()
 
     with tab_delete:
         st.markdown("### Remove a student")
         delete_name = st.selectbox("Select student to remove", working[raw_name_col].astype(str).tolist(), key="delete_student_name")
-        st.warning("Removing a student changes the working data in the app. Your original Excel file is not overwritten automatically.")
+        st.warning("Removing a student changes the working data. Your original Excel file is not overwritten automatically.")
         confirm_delete = st.checkbox("I understand that this student will be removed from the working dataset.", key="confirm_delete_student")
         if st.button("🗑️ Remove Student", type="secondary", disabled=not confirm_delete, use_container_width=True, key="remove_student_button"):
             working = working[working[raw_name_col].astype(str) != delete_name].copy()
             st.session_state.raw_data = working
             st.session_state.data = prepare_data(working, data["analysis_term"])
-            save_results_for_parent_access(working)
+            save_results_store(working)
             st.success(f"Removed {delete_name}.")
             st.rerun()
 
     with tab_export:
         st.markdown("### Save your updated records")
-        st.info("Changes are kept in the current app session. Download the updated Excel file to permanently keep them on your computer.")
+        st.info("Download the updated Excel file to keep a local backup copy.")
         st.write(f"**Current students:** {len(working)}")
         st.write(f"**Current streams:** {working[raw_stream_col].nunique()}")
         excel_buffer = io.BytesIO()
@@ -1925,7 +1986,7 @@ elif page == "Student Records":
 
 elif page == "Academic Results":
     st.subheader("📝 Academic Results Entry & Editing")
-    st.caption("Enter or correct subject marks for a student. The selected term average, grades and rankings are recalculated automatically.")
+    st.caption("Enter or correct subject marks. Rankings are recalculated and saved to the cloud.")
 
     raw_df = st.session_state.get("raw_data")
     if raw_df is None or raw_df.empty:
@@ -1935,7 +1996,7 @@ elif page == "Academic Results":
     working = raw_df.copy()
     _, raw_name_col, raw_stream_col, raw_terms, raw_avg_cols = detect_columns(working)
     if not raw_terms:
-        st.error("No term columns were detected in the uploaded Excel file.")
+        st.error("No term columns were detected.")
         st.stop()
 
     term_choice = st.selectbox(
@@ -1960,7 +2021,6 @@ elif page == "Academic Results":
 
     if not term_subjects:
         st.warning(f"No subject columns were detected for {term_choice.upper()}.")
-        st.info("Your Excel should have columns such as y2t3maths, y2t3english, y2t3biology, etc.")
         st.stop()
 
     result_names = working[raw_name_col].astype(str).tolist()
@@ -1969,7 +2029,6 @@ elif page == "Academic Results":
     current = working.loc[idx]
     st.metric("Stream", str(current[raw_stream_col]))
     st.markdown(f"### {selected_result_student} — {term_choice.upper()}")
-    st.write("Enter marks from **0 to 100**. The system keeps the raw total separate from the average/percentage. A grade is calculated only from the percentage/average, never from the raw total.")
 
     score_inputs = {}
     grid = st.columns(3)
@@ -1988,7 +2047,7 @@ elif page == "Academic Results":
     c.metric("Overall Grade", grade(proposed_average))
     old_avg = pd.to_numeric(current[avg_col], errors="coerce")
     old_avg = 0.0 if pd.isna(old_avg) else float(old_avg)
-    c.metric("Previous Average", f"{old_avg:.1f}%")
+    d.metric("Previous Average", f"{old_avg:.1f}%")
 
     if st.button("💾 Save Academic Results", type="primary", use_container_width=True, key="save_academic_results"):
         for col, value in score_inputs.items():
@@ -1996,8 +2055,8 @@ elif page == "Academic Results":
         working.loc[idx, avg_col] = proposed_average
         st.session_state.raw_data = working
         st.session_state.data = prepare_data(working, data["analysis_term"])
-        save_results_for_parent_access(working)
-        st.success(f"Saved {term_choice.upper()} results for {selected_result_student}. Average updated to {proposed_average:.1f}%. Rankings and reports have been recalculated.")
+        save_results_store(working)
+        st.success(f"Saved {term_choice.upper()} results for {selected_result_student}. Average: {proposed_average:.1f}%. Saved to cloud.")
         st.rerun()
 
     st.markdown("### 📊 Current subject results")
@@ -2010,8 +2069,7 @@ elif page == "Academic Results":
     current_total = sum(row["Mark"] for row in current_rows)
     current_max = len(current_rows) * 100
     current_pct = (current_total / current_max * 100) if current_max else 0.0
-    st.markdown(f"**Total Marks:** {current_total:.1f} / {current_max} &nbsp;&nbsp; **Average / Percentage:** {current_pct:.1f}% &nbsp;&nbsp; **Overall Grade:** {grade(current_pct)}")
-    st.info("💡 The raw total is displayed without a grade. The overall grade is based on the percentage/average. After saving, check Master Merit List, Streams, Students, or the PDF report to see the updated results.")
+    st.markdown(f"**Total Marks:** {current_total:.1f} / {current_max} &nbsp;&nbsp; **Average:** {current_pct:.1f}% &nbsp;&nbsp; **Grade:** {grade(current_pct)}")
 
 
 # ============================================================
@@ -2020,7 +2078,6 @@ elif page == "Academic Results":
 
 elif page == "Streams":
     st.subheader("Stream Management")
-
     streams = sorted(df[stream_col].unique())
     selected_stream = st.selectbox("Select stream", streams)
     sdf = df[df[stream_col] == selected_stream].copy()
@@ -2035,12 +2092,10 @@ elif page == "Streams":
     view = sdf.sort_values("stream_rank")[
         [name_col, "stream_rank", "overall_rank", target, "term_change"] + data["subject_cols"]
     ].copy()
-
     view.columns = (
         ["Student", "Stream Rank", "School Rank", "Final Average", "Change"]
         + [clean_label(s) for s in data["subject_cols"]]
     )
-
     st.dataframe(view.round(1), use_container_width=True, hide_index=True)
 
     st.subheader("Subject means")
@@ -2088,11 +2143,7 @@ elif page == "Master Merit List":
             )
 
     st.markdown("### 📋 Official merit list")
-    if top_n != "All":
-        display = merit.head(int(top_n)).copy()
-    else:
-        display = merit.copy()
-
+    display = merit.head(int(top_n)).copy() if top_n != "All" else merit.copy()
     display = display[["overall_rank", name_col, stream_col, "stream_rank", target, "term_change"]].copy()
     display.columns = ["School Rank", "Student", "Stream", "Stream Rank", "Final Average", "Change"]
     display["Grade"] = display["Final Average"].apply(grade)
@@ -2136,11 +2187,7 @@ elif page == "Master Merit List":
 
 elif page == "Analytics":
     st.subheader("Academic Analytics")
-
-    st.info(
-        "Correlation measures linear association in the current dataset. "
-        "It does not prove causation or guarantee future performance."
-    )
+    st.info("Correlation measures linear association. It does not prove causation.")
 
     corr = correlation_table(data)
     st.dataframe(corr.round(3), use_container_width=True, hide_index=True)
@@ -2165,7 +2212,6 @@ elif page == "Reports":
     if st.button("Generate Master School Report", type="primary"):
         with st.spinner("Generating master report..."):
             pdf = generate_master_pdf(data, st.session_state.school_name)
-
         st.download_button(
             "Download Master School Report",
             data=pdf.getvalue(),
@@ -2175,18 +2221,12 @@ elif page == "Reports":
         )
 
     st.divider()
-
     st.subheader("Generate all student report cards")
-    st.write(
-        f"This creates {len(df)} individual PDF reports and packages them into one ZIP file."
-    )
+    st.write(f"This creates {len(df)} individual PDF reports and packages them into one ZIP file.")
 
     if st.button("Generate ALL Student PDFs"):
         with st.spinner("Generating student reports..."):
-            all_reports = generate_all_student_pdfs(
-                data, st.session_state.school_name
-            )
-
+            all_reports = generate_all_student_pdfs(data, st.session_state.school_name)
         st.download_button(
             "Download All Student Reports (ZIP)",
             data=all_reports.getvalue(),
@@ -2196,10 +2236,8 @@ elif page == "Reports":
         )
 
     st.divider()
-
     st.subheader("Export processed data")
     csv_data = df.to_csv(index=False).encode("utf-8")
-
     st.download_button(
         "Download Processed CSV",
         data=csv_data,
@@ -2215,7 +2253,7 @@ elif page == "Reports":
 
 elif page == "Learning Centre":
     st.subheader("📚 Learning Centre")
-    st.write("A central place for teachers to post assignments, notes and revision materials, and for students to access and submit work.")
+    st.write("Post assignments, notes and revision materials; students access and submit work.")
 
     role = st.session_state.user_role
     materials = get_materials()
@@ -2239,7 +2277,6 @@ elif page == "Learning Centre":
 
     if role in ("admin", "teacher"):
         assignments = [m for m in materials if m.get("material_type") == "Assignment"]
-        reviewed = sum(1 for s in all_submissions if s.get("status") == "Reviewed")
         pending = sum(1 for s in all_submissions if s.get("status") != "Reviewed")
         overdue = 0
         for m in assignments:
@@ -2253,16 +2290,9 @@ elif page == "Learning Centre":
         st.markdown("### 📊 Learning Centre Dashboard")
         a,b,c,d=st.columns(4)
         a.metric("Assignments", len(assignments))
-        b.metric("Student Submissions", len(all_submissions))
+        b.metric("Submissions", len(all_submissions))
         c.metric("Awaiting Review", pending)
-        d.metric("Overdue Assignments", overdue)
-
-        recent = sorted(materials, key=lambda x: x.get("created_at", ""), reverse=True)[:5]
-        if recent:
-            st.markdown("### 🔔 Recent Learning Centre Activity")
-            for m in recent:
-                icon = "📝" if m.get("material_type") == "Assignment" else ("📢" if m.get("material_type") == "Announcement" else "📚")
-                st.write(f"{icon} **{m.get('title','Untitled')}** — {m.get('material_type','Material')} • {m.get('target_stream','All Streams')}")
+        d.metric("Overdue", overdue)
 
         tab1, tab2, tab3 = st.tabs(["📤 Post Material", "📋 Posted Materials", "📥 Student Submissions"])
         with tab1:
@@ -2290,12 +2320,18 @@ elif page == "Learning Centre":
                     saved_name=""; saved_path=""
                     if file is not None:
                         safe=re.sub(r"[^A-Za-z0-9._-]+", "_", file.name)
-                        folder=os.path.join(LEARNING_DIR,"materials"); os.makedirs(folder,exist_ok=True)
-                        saved_path=os.path.join(folder,safe)
-                        with open(saved_path,"wb") as f: f.write(file.getbuffer())
                         saved_name=safe
-                    add_material(title.strip(),mtype,subject.strip(),target_stream,description.strip(),str(deadline) if deadline else "",saved_name,saved_path,external_link.strip(),st.session_state.username)
-                    st.success("Material published successfully.")
+                        # Store the file content directly in the database
+                        file_content = file.getbuffer().tobytes().hex()
+                        saved_path = file_content[:500]
+                        # Store the actual file bytes in a simple base64-like approach
+                        import base64
+                        file_b64 = base64.b64encode(file.getbuffer()).decode('utf-8')
+                        saved_path = "BASE64::" + file_b64
+                    add_material(title.strip(),mtype,subject.strip(),target_stream,description.strip(),
+                                 str(deadline) if deadline else "",saved_name,saved_path,
+                                 external_link.strip(),st.session_state.username)
+                    st.success("Material published to cloud.")
                     st.rerun()
 
         with tab2:
@@ -2308,9 +2344,13 @@ elif page == "Learning Centre":
                     if m['deadline']: st.write(f"**Deadline:** {m['deadline']}")
                     if m['description']: st.write(m['description'])
                     cols=st.columns([1,1,1,1])
-                    if m['file_path'] and os.path.exists(m['file_path']):
-                        with open(m['file_path'],'rb') as f:
-                            cols[0].download_button("⬇️ Download file", f.read(), file_name=m['file_name'], key=f"dlm{m['id']}")
+                    if m['file_path'] and str(m['file_path']).startswith("BASE64::"):
+                        import base64
+                        try:
+                            raw = base64.b64decode(m['file_path'][8:])
+                            cols[0].download_button("⬇️ Download file", raw, file_name=m['file_name'], key=f"dlm{m['id']}")
+                        except Exception:
+                            pass
                     if m['external_link']:
                         cols[1].markdown(f"[🔗 Open link]({m['external_link']})")
                     if cols[3].button("🗑️ Delete", key=f"delm{m['id']}"):
@@ -2329,18 +2369,20 @@ elif page == "Learning Centre":
                 selected_label=st.selectbox("Submission", list(sub_options))
                 selected=sub_options[selected_label]
                 feedback=st.text_area("Teacher feedback", value=selected.get("teacher_feedback", ""), key=f"feedback_{selected['id']}")
-                if selected["file_path"] and os.path.exists(selected["file_path"]):
-                    with open(selected["file_path"],"rb") as f:
-                        st.download_button("⬇️ Download submitted work", f.read(), file_name=selected["file_name"], key=f"subdl{selected['id']}")
                 if st.button("Save Feedback", type="primary"):
-                    conn=db_conn(); conn.execute("UPDATE submissions SET teacher_feedback=?, status='Reviewed' WHERE id=?",(feedback.strip(),selected["id"])); conn.commit(); conn.close(); st.success("Feedback saved."); st.rerun()
+                    update_quiz_feedback(selected['id'], feedback, 'Reviewed')
+                    st.success("Feedback saved."); st.rerun()
 
     else:
         st.markdown("### 🎓 Student Learning Dashboard")
-        student_name=st.session_state.student_name.strip()
+        student_name = st.session_state.student_name.strip()
         if not student_name:
-            st.warning("This demo student account is not yet linked to a student record. An administrator can later link student accounts to actual names.")
-            student_name=st.text_input("For this demo, enter your student name")
+            sp = get_student_profile(st.session_state.username)
+            if sp:
+                student_name = (sp.get("student_full_name") or "").strip()
+        if not student_name:
+            st.warning("Enter the student name used in the academic Excel file.")
+            student_name=st.text_input("Student name")
 
         student_submissions = get_submissions(student_name=student_name) if student_name else []
         student_materials = []
@@ -2355,15 +2397,13 @@ elif page == "Learning Centre":
 
         assignments=[m for m in student_materials if m.get("material_type")=="Assignment"]
         submitted_ids={s.get("material_id") for s in student_submissions}
-        pending_count=sum(1 for m in assignments if m.get("id") not in submitted_ids and (not m.get("deadline") or datetime.now().date() <= datetime.strptime(m["deadline"], "%Y-%m-%d").date()))
-        overdue_count=sum(1 for m in assignments if m.get("id") not in submitted_ids and m.get("deadline") and datetime.now().date() > datetime.strptime(m["deadline"], "%Y-%m-%d").date())
+        pending_count=sum(1 for m in assignments if m.get("id") not in submitted_ids)
         reviewed_count=sum(1 for s in student_submissions if s.get("status")=="Reviewed")
 
-        a,b,c,d=st.columns(4)
+        a,b,c=st.columns(3)
         a.metric("Available Materials", len(student_materials))
         b.metric("Pending Assignments", pending_count)
-        c.metric("Overdue", overdue_count)
-        d.metric("Feedback Received", reviewed_count)
+        c.metric("Feedback Received", reviewed_count)
 
         announcements=[m for m in student_materials if m.get("material_type")=="Announcement"]
         if announcements:
@@ -2381,11 +2421,11 @@ elif page == "Learning Centre":
                 rows.append({"Assignment":m["title"],"Subject":m.get("subject") or "General","Deadline":m.get("deadline") or "No deadline","Status":lc_status(m,student_name)})
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         else:
-            st.info("No assignments are currently available.")
+            st.info("No assignments available.")
 
         st.markdown("### 📖 My Learning Materials")
         if not student_materials:
-            st.info("No learning materials are currently available for you.")
+            st.info("No materials available.")
         for m in student_materials:
             with st.container(border=True):
                 st.markdown(f"### {m['title']}")
@@ -2393,9 +2433,13 @@ elif page == "Learning Centre":
                 if m['deadline']: st.write(f"**Deadline:** {m['deadline']}")
                 if m['description']: st.write(m['description'])
                 cols=st.columns(3)
-                if m['file_path'] and os.path.exists(m['file_path']):
-                    with open(m['file_path'],'rb') as f:
-                        cols[0].download_button("⬇️ Download", f.read(), file_name=m['file_name'], key=f"stdl{m['id']}")
+                if m['file_path'] and str(m['file_path']).startswith("BASE64::"):
+                    import base64
+                    try:
+                        raw = base64.b64decode(m['file_path'][8:])
+                        cols[0].download_button("⬇️ Download", raw, file_name=m['file_name'], key=f"stdl{m['id']}")
+                    except Exception:
+                        pass
                 if m['external_link']: cols[1].markdown(f"[🔗 Open resource]({m['external_link']})")
                 previous=get_submissions(material_id=m['id'], student_name=student_name)
                 if previous:
@@ -2403,10 +2447,12 @@ elif page == "Learning Centre":
                     if previous[0]['teacher_feedback']: st.info(f"Teacher feedback: {previous[0]['teacher_feedback']}")
                 upload=st.file_uploader("Submit your work", type=None, key=f"submission_{m['id']}")
                 if st.button("📤 Submit Work", key=f"submit_{m['id']}", type="primary"):
-                    if not student_name.strip(): st.error("Enter your student name first.")
-                    elif upload is None: st.error("Choose your file first.")
+                    if upload is None: st.error("Choose your file first.")
                     else:
-                        save_submission(m['id'],student_name.strip(),upload); st.success("Work submitted successfully."); st.rerun()
+                        import base64
+                        file_b64 = "BASE64::" + base64.b64encode(upload.getbuffer()).decode('utf-8')
+                        save_submission(m['id'], student_name.strip(), upload, file_b64)
+                        st.success("Work submitted."); st.rerun()
 
 
 # ============================================================
@@ -2415,7 +2461,7 @@ elif page == "Learning Centre":
 
 elif page == "Online Tests & Quizzes":
     st.subheader("🧪 Online Tests & Quizzes")
-    st.write("Create, deliver, mark and review online tests. Multiple-choice and True/False questions are marked automatically; short-answer questions can be reviewed by the teacher.")
+    st.write("Create and deliver online tests. Objective questions auto-mark; short answers reviewed by teacher.")
 
     role = st.session_state.user_role
     quizzes = get_quizzes()
@@ -2441,7 +2487,6 @@ elif page == "Online Tests & Quizzes":
         create_tab, manage_tab, results_tab = st.tabs(["➕ Create Quiz", "📋 Manage Quizzes", "📊 Student Results"])
 
         with create_tab:
-            st.markdown("### Create a new online test")
             c1,c2=st.columns(2)
             with c1:
                 qtitle=st.text_input("Quiz title", placeholder="e.g. Mathematics Test 1")
@@ -2455,7 +2500,6 @@ elif page == "Online Tests & Quizzes":
                 qdeadline=st.date_input("Closing date (optional)", value=None, key="quiz_deadline")
                 qduration=st.number_input("Time limit (minutes)", min_value=1, max_value=300, value=30, step=5)
             n_questions=st.number_input("Number of questions", min_value=1, max_value=30, value=5, step=1)
-            st.caption("For each question, choose Multiple Choice, True/False or Short Answer. Objective questions are auto-marked.")
             questions=[]
             for i in range(1,int(n_questions)+1):
                 with st.container(border=True):
@@ -2482,37 +2526,30 @@ elif page == "Online Tests & Quizzes":
                 if not qtitle.strip():
                     st.error("Enter a quiz title.")
                 elif any(not q["text"] for q in questions):
-                    st.error("Every question must have question text.")
-                elif any(q["type"]=="Multiple Choice" and any(not q.get(k,"" ).strip() for k in ["a","b","c","d"]) for q in questions):
-                    st.error("Complete all four options for every multiple-choice question.")
+                    st.error("Every question must have text.")
                 else:
-                    quiz_id=add_quiz(qtitle.strip(),qsubject.strip(),qstream,qdesc.strip(),str(qdeadline) if qdeadline else "",qduration,st.session_state.username,questions)
-                    st.success(f"Quiz published successfully. Quiz ID: {quiz_id}")
+                    add_quiz(qtitle.strip(),qsubject.strip(),qstream,qdesc.strip(),
+                             str(qdeadline) if qdeadline else "",qduration,
+                             st.session_state.username,questions)
+                    st.success("Quiz published to cloud.")
                     st.rerun()
 
         with manage_tab:
             if not quizzes:
-                st.info("No quizzes have been created yet.")
+                st.info("No quizzes created yet.")
             for qz in quizzes:
                 with st.container(border=True):
                     st.markdown(f"### {qz['title']}")
                     st.write(f"**Subject:** {qz['subject'] or 'General'} • **Target:** {qz['target_stream']} • **Time:** {qz['duration_minutes']} minutes")
                     if qz['deadline']: st.write(f"**Closing date:** {qz['deadline']}")
                     qs=get_quiz_questions(qz['id'])
-                    st.caption(f"{len(qs)} questions • Created by {qz['created_by']} on {qz['created_at']}")
-                    mc=st.columns([1,1,1])
-                    if mc[0].button("👁️ Preview", key=f"qprev{qz['id']}"):
-                        for qq in qs:
-                            st.write(f"**{qq['question_no']}. {qq['question_text']}** ({qq['points']} marks)")
-                            if qq['question_type']=="Multiple Choice": st.write(f"A. {qq['option_a']}  |  B. {qq['option_b']}  |  C. {qq['option_c']}  |  D. {qq['option_d']}")
-                            elif qq['question_type']=="True / False": st.write("True / False")
-                            else: st.write("Short answer")
-                    if mc[2].button("🗑️ Delete", key=f"qdel{qz['id']}"):
+                    st.caption(f"{len(qs)} questions")
+                    if st.button("🗑️ Delete", key=f"qdel{qz['id']}"):
                         delete_quiz(qz['id']); st.rerun()
 
         with results_tab:
             if not attempts:
-                st.info("No students have attempted a quiz yet.")
+                st.info("No attempts yet.")
             else:
                 result_rows=[]
                 for a in attempts:
@@ -2525,26 +2562,18 @@ elif page == "Online Tests & Quizzes":
                 selected=options[selected_label]
                 pct,g=quiz_grade(selected['score'],selected['total_points'])
                 x,y,z=st.columns(3); x.metric("Score",f"{selected['score']:.1f}/{selected['total_points']:.1f}"); y.metric("Percentage",f"{pct:.1f}%"); z.metric("Grade",g)
-                st.write(f"**Status:** {selected['status']}")
-                answers=json.loads(selected.get('answers_json') or '{}')
-                for qq in get_quiz_questions(selected['quiz_id']):
-                    ans=answers.get(str(qq['id']),"")
-                    st.write(f"**{qq['question_no']}. {qq['question_text']}**")
-                    st.write(f"Student answer: **{ans or 'No answer'}**")
-                    if qq['correct_answer']:
-                        st.caption(f"Correct answer: {qq['correct_answer']}")
                 feedback=st.text_area("Teacher feedback", value=selected.get('teacher_feedback',''), key=f"qfeedback{selected['id']}")
                 if st.button("Save Quiz Feedback", type="primary"):
-                    update_quiz_feedback(selected['id'],feedback); st.success("Quiz feedback saved."); st.rerun()
+                    update_quiz_feedback(selected['id'],feedback); st.success("Feedback saved."); st.rerun()
 
     else:
         student_name=st.session_state.student_name.strip()
         if not student_name:
-            student_profile = get_student_profile(st.session_state.username)
-            if student_profile:
-                student_name = (student_profile.get("student_full_name") or "").strip()
+            sp = get_student_profile(st.session_state.username)
+            if sp:
+                student_name = (sp.get("student_full_name") or "").strip()
         if not student_name:
-            st.warning("This demo student account is not yet linked to a student record. Enter the student name used in the academic Excel file.")
+            st.warning("Enter the student name used in the academic Excel file.")
             student_name=st.text_input("Student name", key="quiz_student_name")
         streams=student_streams_for(student_name)
         available=[q for q in quizzes if quiz_available_for_student(q,streams)]
@@ -2552,10 +2581,10 @@ elif page == "Online Tests & Quizzes":
         attempted_ids={a['quiz_id'] for a in attempts}
         pending=[q for q in available if q['id'] not in attempted_ids]
         st.markdown("### 🎓 Student Quiz Dashboard")
-        a,b,c=st.columns(3); a.metric("Available Quizzes",len(available)); b.metric("Pending",len(pending)); c.metric("Completed",len(attempts))
+        a,b,c=st.columns(3); a.metric("Available",len(available)); b.metric("Pending",len(pending)); c.metric("Completed",len(attempts))
         take_tab, result_tab=st.tabs(["📝 Available Quizzes","🏆 My Results"])
         with take_tab:
-            if not pending: st.info("There are no new quizzes available for you.")
+            if not pending: st.info("No new quizzes available.")
             for qz in pending:
                 with st.container(border=True):
                     st.markdown(f"### {qz['title']}")
@@ -2569,7 +2598,6 @@ elif page == "Online Tests & Quizzes":
                 qz=next((q for q in available if q['id']==active),None)
                 if qz:
                     st.divider(); st.markdown(f"## 📝 {qz['title']}")
-                    st.warning(f"Time limit: {qz['duration_minutes']} minutes. Submit when you have finished.")
                     answers={}; total=0; auto_score=0; has_manual=False
                     for qq in get_quiz_questions(qz['id']):
                         pts=float(qq['points']); total += pts
@@ -2591,10 +2619,10 @@ elif page == "Online Tests & Quizzes":
                         status="Needs Teacher Review" if has_manual else "Submitted"
                         save_quiz_attempt(qz['id'],student_name.strip(),answers,auto_score,total,status)
                         st.session_state.active_quiz=None
-                        st.success(f"Quiz submitted. Auto-marked score: {auto_score:.1f}/{total:.1f}." + (" A teacher will review the short-answer question(s)." if has_manual else ""))
+                        st.success(f"Submitted. Score: {auto_score:.1f}/{total:.1f}")
                         st.rerun()
         with result_tab:
-            if not attempts: st.info("You have not completed any quizzes yet.")
+            if not attempts: st.info("No attempts yet.")
             for a in attempts:
                 pct,g=quiz_grade(a['score'],a['total_points'])
                 with st.container(border=True):
@@ -2616,10 +2644,8 @@ elif page == "My Profile":
         st.write(f"**Role:** Student")
         st.write(f"**Linked student name:** {profile.get('student_full_name', 'Not linked')}")
     else:
-        st.info("The student portal is ready for account-to-student linking.")
+        st.info("Not linked. Please contact the school administrator.")
         st.write(f"**Username:** {st.session_state.username}")
-        st.write(f"**Role:** Student")
-        st.write(f"**Linked student:** Not linked")
 
 
 # ============================================================
@@ -2628,7 +2654,6 @@ elif page == "My Profile":
 
 elif page == "Settings":
     st.subheader("School Profile & System Settings")
-    st.write("Use this page to brand the system and the official PDF reports.")
 
     tab_profile, tab_password, tab_parents, tab_students, tab_backup = st.tabs([
         "🏫 School Profile",
@@ -2642,7 +2667,7 @@ elif page == "Settings":
         left, right = st.columns(2)
         with left:
             new_name = st.text_input("School name", value=st.session_state.school_name)
-            address = st.text_input("School address / location", value=st.session_state.school_address)
+            address = st.text_input("School address", value=st.session_state.school_address)
             phone = st.text_input("School phone", value=st.session_state.school_phone)
             email = st.text_input("School email", value=st.session_state.school_email)
         with right:
@@ -2652,28 +2677,27 @@ elif page == "Settings":
                 index=["Term 1", "Term 2", "Term 3"].index(st.session_state.current_term)
                 if st.session_state.current_term in ["Term 1", "Term 2", "Term 3"] else 2
             )
-            logo = st.file_uploader("School logo (PNG/JPG)", type=["png", "jpg", "jpeg"], key="school_logo_upload")
+            logo = st.file_uploader("School logo", type=["png", "jpg", "jpeg"], key="school_logo_upload")
             if logo is not None:
-                st.image(logo, width=120, caption="Logo preview")
+                st.image(logo, width=120)
 
         st.divider()
-        st.write("### 📝 Report Card Signatures & Principal Comment")
+        st.write("### Report Card Signatures & Principal Comment")
         sig_left, sig_right = st.columns(2)
         with sig_left:
             teacher_name = st.text_input("Class teacher name", value=st.session_state.class_teacher_name)
-            teacher_sig = st.file_uploader("Class teacher signature (PNG/JPG)", type=["png", "jpg", "jpeg"], key="teacher_signature_upload")
+            teacher_sig = st.file_uploader("Teacher signature", type=["png", "jpg", "jpeg"], key="teacher_signature_upload")
             if teacher_sig is not None:
-                st.image(teacher_sig, width=180, caption="Class teacher signature preview")
+                st.image(teacher_sig, width=180)
         with sig_right:
-            principal_name = st.text_input("Principal / Head Teacher name", value=st.session_state.principal_name)
-            principal_sig = st.file_uploader("Principal signature (PNG/JPG)", type=["png", "jpg", "jpeg"], key="principal_signature_upload")
+            principal_name = st.text_input("Principal name", value=st.session_state.principal_name)
+            principal_sig = st.file_uploader("Principal signature", type=["png", "jpg", "jpeg"], key="principal_signature_upload")
             if principal_sig is not None:
-                st.image(principal_sig, width=180, caption="Principal signature preview")
+                st.image(principal_sig, width=180)
         principal_comment = st.text_area(
-            "Default Principal / Head Teacher comment",
+            "Default Principal comment",
             value=st.session_state.principal_comment,
-            height=100,
-            help="This comment is used on report cards unless you change it here."
+            height=100
         )
 
         if st.button("Save School Profile", type="primary", use_container_width=True):
@@ -2692,49 +2716,40 @@ elif page == "Settings":
                 st.session_state.teacher_signature = teacher_sig.getvalue()
             if principal_sig is not None:
                 st.session_state.principal_signature = principal_sig.getvalue()
-            st.success("School profile saved.")
+            st.success("Saved.")
 
     with tab_password:
-        st.write("### 🔒 Change your password")
-        st.caption("You are signed in as: **" + st.session_state.username + "** (" + st.session_state.user_role + ")")
+        st.write("### Change your password")
+        st.caption(f"Signed in as: **{st.session_state.username}** ({st.session_state.user_role})")
         if st.session_state.user_role == "admin":
-            st.info("The default administrator account (admin/admin123) cannot be changed from here. To change it, edit the admin credentials in app.py.")
+            st.info("The admin account uses fixed credentials in code. To change, edit them in app.py.")
         else:
             old_pw = st.text_input("Current password", type="password", key="pw_old")
             new_pw = st.text_input("New password", type="password", key="pw_new")
             confirm_pw = st.text_input("Confirm new password", type="password", key="pw_confirm")
             if st.button("Update Password", type="primary", use_container_width=True):
                 if not old_pw or not new_pw or not confirm_pw:
-                    st.error("Fill in all three fields.")
+                    st.error("Fill in all fields.")
                 elif new_pw != confirm_pw:
                     st.error("New passwords do not match.")
                 elif len(new_pw) < 6:
-                    st.error("New password should be at least 6 characters.")
+                    st.error("Password must be at least 6 characters.")
                 else:
-                    conn = db_conn()
-                    row = conn.execute("SELECT password FROM users WHERE username=?", (st.session_state.username,)).fetchone()
-                    if not row or not verify_password(old_pw, row[0]):
-                        conn.close()
+                    user = authenticate_user(st.session_state.username, old_pw)
+                    if not user:
                         st.error("Current password is incorrect.")
                     else:
-                        conn.execute("UPDATE users SET password=? WHERE username=?",
-                                     (hash_password(new_pw), st.session_state.username))
-                        conn.commit()
-                        conn.close()
-                        st.success("Password updated successfully. Use the new password next time you sign in.")
+                        change_user_password(st.session_state.username, new_pw)
+                        st.success("Password updated.")
 
     with tab_parents:
         st.caption("Link a parent account to one or more student names. Use | between multiple children.")
-        conn = db_conn()
-        parent_rows = conn.execute("SELECT username,parent_name,child_names FROM parents ORDER BY username").fetchall()
-        conn.close()
-
-        if parent_rows:
-            st.dataframe(
-                pd.DataFrame([dict(r) for r in parent_rows]),
-                use_container_width=True,
-                hide_index=True
-            )
+        try:
+            parent_rows = supabase.table("parents").select("username,parent_name,child_names").order("username").execute().data
+            if parent_rows:
+                st.dataframe(pd.DataFrame(parent_rows), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
 
         pa1, pa2 = st.columns(2)
         with pa1:
@@ -2742,45 +2757,27 @@ elif page == "Settings":
             parent_name = st.text_input("Parent / Guardian name", key="new_parent_name")
         with pa2:
             parent_password = st.text_input("Parent password", type="password", key="new_parent_password")
-            linked_children = st.text_input(
-                "Linked student name(s)",
-                placeholder="e.g. Jane Wanjiku | Peter Kamau",
-                key="new_parent_children"
-            )
+            linked_children = st.text_input("Linked student name(s)", placeholder="e.g. Jane Wanjiku | Peter Kamau", key="new_parent_children")
 
         if st.button("➕ Create / Update Parent Account", type="primary", use_container_width=True):
             if not parent_username.strip() or not parent_name.strip() or not parent_password.strip() or not linked_children.strip():
-                st.error("Enter the parent username, name, password and at least one linked student name.")
+                st.error("Fill in all fields.")
             else:
-                hashed_pwd = hash_password(parent_password)
-                conn = db_conn()
-                conn.execute(
-                    "INSERT INTO users(username,password,role,student_name) VALUES(?,?,?,?) "
-                    "ON CONFLICT(username) DO UPDATE SET password=excluded.password, role='parent'",
-                    (parent_username.strip(), hashed_pwd, "parent", "")
-                )
-                conn.execute(
-                    "INSERT INTO parents(username,parent_name,child_names,created_at) VALUES(?,?,?,?) "
-                    "ON CONFLICT(username) DO UPDATE SET parent_name=excluded.parent_name, child_names=excluded.child_names",
-                    (parent_username.strip(), parent_name.strip(), linked_children.strip(), datetime.now().strftime("%Y-%m-%d %H:%M"))
-                )
-                conn.commit()
-                conn.close()
-                st.success("Parent account saved. The parent can now sign in using the new credentials.")
-                st.rerun()
+                try:
+                    create_or_update_parent(parent_username.strip(), parent_name.strip(), parent_password, linked_children.strip())
+                    st.success("Parent account saved to cloud.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
     with tab_students:
-        st.caption("Link a student account to one student name so that the student can view their own results.")
-        conn = db_conn()
-        student_rows = conn.execute("SELECT username,student_full_name FROM students ORDER BY username").fetchall()
-        conn.close()
-
-        if student_rows:
-            st.dataframe(
-                pd.DataFrame([dict(r) for r in student_rows]),
-                use_container_width=True,
-                hide_index=True
-            )
+        st.caption("Link a student account to one student name so the student can view their own results.")
+        try:
+            student_rows = supabase.table("students").select("username,student_full_name").order("username").execute().data
+            if student_rows:
+                st.dataframe(pd.DataFrame(student_rows), use_container_width=True, hide_index=True)
+        except Exception:
+            pass
 
         sa1, sa2 = st.columns(2)
         with sa1:
@@ -2791,28 +2788,18 @@ elif page == "Settings":
 
         if st.button("➕ Create / Update Student Account", type="primary", use_container_width=True):
             if not student_username.strip() or not student_full_name.strip() or not student_password.strip():
-                st.error("Enter the student username, name and password.")
+                st.error("Fill in all fields.")
             else:
-                hashed_pwd = hash_password(student_password)
-                conn = db_conn()
-                conn.execute(
-                    "INSERT INTO users(username,password,role,student_name) VALUES(?,?,?,?) "
-                    "ON CONFLICT(username) DO UPDATE SET password=excluded.password, role='student', student_name=excluded.student_name",
-                    (student_username.strip(), hashed_pwd, "student", student_full_name.strip())
-                )
-                conn.execute(
-                    "INSERT INTO students(username,student_full_name,created_at) VALUES(?,?,?) "
-                    "ON CONFLICT(username) DO UPDATE SET student_full_name=excluded.student_full_name",
-                    (student_username.strip(), student_full_name.strip(), datetime.now().strftime("%Y-%m-%d %H:%M"))
-                )
-                conn.commit()
-                conn.close()
-                st.success("Student account saved. The student can now sign in using the new credentials.")
-                st.rerun()
+                try:
+                    create_or_update_student(student_username.strip(), student_full_name.strip(), student_password)
+                    st.success("Student account saved to cloud.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
 
     with tab_backup:
-        st.write("### 💾 Download a full backup")
-        st.caption("This ZIP contains the database, the current results file and every uploaded Learning Centre file.")
+        st.write("### Download a full backup")
+        st.caption("ZIP with all cloud tables as JSON files.")
         if st.button("Prepare Backup ZIP", type="primary", use_container_width=True):
             with st.spinner("Packaging backup..."):
                 backup = create_backup_zip()
@@ -2825,15 +2812,6 @@ elif page == "Settings":
             )
 
         st.divider()
-        st.write("### Current school profile")
-        st.write(f"**School:** {st.session_state.school_name}")
-        st.write(f"**Location:** {st.session_state.school_address or 'Not set'}")
-        st.write(f"**Phone:** {st.session_state.school_phone or 'Not set'}")
-        st.write(f"**Email:** {st.session_state.school_email or 'Not set'}")
-        st.write(f"**Academic year:** {st.session_state.academic_year}")
-        st.write(f"**Current term:** {st.session_state.current_term}")
-
-        st.divider()
         st.write("### Current data")
         st.write(f"**File:** {st.session_state.raw_file_name or 'No file loaded'}")
         if data is not None:
@@ -2841,6 +2819,4 @@ elif page == "Settings":
             st.write(f"**Students:** {len(df)}")
             st.write(f"**Streams:** {df[stream_col].nunique()}")
 
-        st.warning(
-            "Parent and student accounts are linked to specific students. For deployment over the internet, use HTTPS and a hosted database."
-        )
+        st.success("✅ All data is stored in Supabase — it persists across app restarts.")
