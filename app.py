@@ -116,12 +116,6 @@ BACKUP_DIR = "system_backups"
 os.makedirs(BACKUP_DIR, exist_ok=True)
 
 
-# ============================================================
-# SUPABASE CLIENT
-# ============================================================
-# Credentials come from Streamlit Secrets (configured in the cloud dashboard).
-# Locally they can be placed in .streamlit/secrets.toml
-
 def get_supabase_client() -> Client:
     url = st.secrets.get("SUPABASE_URL", "")
     key = st.secrets.get("SUPABASE_KEY", "")
@@ -136,10 +130,6 @@ def get_supabase_client() -> Client:
 
 supabase = get_supabase_client()
 
-
-# ============================================================
-# PASSWORD HASHING
-# ============================================================
 
 def hash_password(password, salt=None):
     if salt is None:
@@ -157,12 +147,7 @@ def verify_password(password, stored):
     return hash_password(password, salt) == f"{salt}${hashed}"
 
 
-# ============================================================
-# USER / AUTH FUNCTIONS (Supabase)
-# ============================================================
-
 def ensure_demo_users():
-    """Insert demo accounts if they don't exist yet (hashed passwords)."""
     try:
         for uname, pwd, role in [("teacher", "teacher123", "teacher"),
                                   ("student", "student123", "student")]:
@@ -189,7 +174,6 @@ def authenticate_user(username, password):
         user = result.data[0]
         if not verify_password(password, user.get("password", "")):
             return None
-        # Upgrade legacy plain-text password to hashed
         if "$" not in (user.get("password") or ""):
             supabase.table("users").update({
                 "password": hash_password(password)
@@ -218,7 +202,6 @@ def get_student_profile(username):
 
 def create_or_update_parent(username, parent_name, password, child_names):
     hashed = hash_password(password)
-    # users row
     existing = supabase.table("users").select("username").eq("username", username).execute()
     if existing.data:
         supabase.table("users").update({
@@ -229,7 +212,6 @@ def create_or_update_parent(username, parent_name, password, child_names):
             "username": username, "password": hashed,
             "role": "parent", "student_name": ""
         }).execute()
-    # parents row
     existing_p = supabase.table("parents").select("username").eq("username", username).execute()
     if existing_p.data:
         supabase.table("parents").update({
@@ -276,10 +258,6 @@ def change_user_password(username, new_password):
     }).eq("username", username).execute()
 
 
-# ============================================================
-# RESULTS STORE (replaces the local xlsx file)
-# ============================================================
-
 def save_results_store(raw_df):
     try:
         records = raw_df.fillna("").to_dict(orient="records")
@@ -296,12 +274,9 @@ def save_results_store(raw_df):
                 "data_json": data_json,
                 "updated_at": datetime.now().isoformat()
             }).execute()
-        st.success("✅ Saved to Supabase")
         return True
     except Exception as e:
-        st.error(f"❌ CLOUD SAVE FAILED: {e}")
-        import traceback
-        st.code(traceback.format_exc())
+        st.warning(f"Could not save results to cloud: {e}")
         return False
 
 
@@ -315,10 +290,6 @@ def load_results_store():
     except Exception:
         return None
 
-
-# ============================================================
-# LEARNING CENTRE (Supabase)
-# ============================================================
 
 def add_material(title, material_type, subject, target_stream, description,
                  deadline, file_name, file_path, external_link, uploaded_by):
@@ -376,7 +347,6 @@ def get_submissions(material_id=None, student_name=None):
             query = query.eq("student_name", student_name)
         result = query.order("id", desc=True).execute()
         rows = result.data or []
-        # Attach material title/subject
         for r in rows:
             mat = supabase.table("materials").select("title,subject").eq("id", r["material_id"]).execute()
             if mat.data:
@@ -394,10 +364,6 @@ def delete_material(material_id):
     except Exception:
         pass
 
-
-# ============================================================
-# QUIZZES (Supabase)
-# ============================================================
 
 def add_quiz(title, subject, target_stream, description, deadline,
              duration_minutes, created_by, questions):
@@ -516,12 +482,7 @@ def quiz_grade(score, total):
     return pct, grade(pct)
 
 
-# ============================================================
-# BACKUP
-# ============================================================
-
 def create_backup_zip():
-    """Create a ZIP with all Supabase tables dumped as JSON."""
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for table in ["users", "parents", "students", "materials",
@@ -597,14 +558,15 @@ def login_screen():
         password = st.text_input("Password", type="password")
 
         if st.button("Sign in", type="primary", use_container_width=True):
-            if role == "Administrator":
-                valid = username == "admin" and password == "admin123"
-                user = {"role": "admin", "username": "admin", "student_name": ""} if valid else None
-            else:
-                user = authenticate_user(username, password)
-                if user and ((role == "Teacher" and user["role"] != "teacher")
-                             or (role == "Student" and user["role"] != "student")
-                             or (role == "Parent" and user["role"] != "parent")):
+            user = authenticate_user(username, password)
+            if user:
+                valid_role = (
+                    (role == "Administrator" and user["role"] == "admin")
+                    or (role == "Teacher" and user["role"] == "teacher")
+                    or (role == "Student" and user["role"] == "student")
+                    or (role == "Parent" and user["role"] == "parent")
+                )
+                if not valid_role:
                     user = None
             if user:
                 st.session_state.logged_in = True
@@ -615,8 +577,8 @@ def login_screen():
             else:
                 st.error("Incorrect username, password, or role.")
 
-        st.caption("Demo accounts: admin/admin123 • teacher/teacher123 • student/student123")
-        st.info("Accounts are stored securely in Supabase with hashed passwords.")
+        st.caption("Please sign in with your account credentials.")
+        st.info("All accounts are stored securely in Supabase with hashed passwords.")
 
     st.stop()
 
@@ -1313,19 +1275,20 @@ if uploaded:
     except Exception as exc:
         st.sidebar.error(f"Excel error: {exc}")
 
-# Try to load saved results from Supabase before showing the welcome screen
+# Try to load saved results from Supabase first (for all roles)
 if st.session_state.data is None:
     persisted = load_results_store()
-if persisted is not None and not persisted.empty:
-    try:
-        _, _, _, detected_terms, _ = detect_columns(persisted)
-        if detected_terms:
-            term_for_role = detected_terms[-1]
-            st.session_state.raw_data = persisted.copy()
-            st.session_state.data = prepare_data(persisted, term_for_role)
-    except Exception:
-        pass   
+    if persisted is not None and not persisted.empty:
+        try:
+            _, _, _, detected_terms, _ = detect_columns(persisted)
+            if detected_terms:
+                term_for_role = detected_terms[-1]
+                st.session_state.raw_data = persisted.copy()
+                st.session_state.data = prepare_data(persisted, term_for_role)
+        except Exception:
+            pass
 
+# If still no data and user is admin/teacher, show welcome + upload prompt
 if st.session_state.data is None and st.session_state.user_role not in ["student", "parent"]:
     st.markdown(
         '<div class="app-title">Welcome to the Academic Management System</div>',
@@ -1353,22 +1316,6 @@ if st.session_state.data is None and st.session_state.user_role not in ["student
     st.write("4. Use the navigation menu to explore the system.")
     st.stop()
 
-# Parents and students read the latest saved results from Supabase
-
-if st.session_state.data is None:
-    persisted = load_results_store()
-    st.write(f"DEBUG: load_results_store returned: {type(persisted)} | is None: {persisted is None} | empty: {persisted.empty if persisted is not None else 'N/A'}")
-    if persisted is not None and not persisted.empty:
-        try:
-            _, _, _, detected_terms, _ = detect_columns(persisted)
-            st.write(f"DEBUG: detected_terms = {detected_terms}")
-            if detected_terms:
-                term_for_role = detected_terms[-1]
-                st.session_state.raw_data = persisted.copy()
-                st.session_state.data = prepare_data(persisted, term_for_role)
-                st.write("DEBUG: data loaded successfully")
-        except Exception as e:
-            st.error(f"DEBUG ERROR: {e}")
 if st.session_state.data is None and st.session_state.user_role in ["student", "parent"]:
     data = None
     df = pd.DataFrame()
@@ -1385,7 +1332,7 @@ st.markdown(
     unsafe_allow_html=True
 )
 st.markdown(
-    f'<div class="app-subtitle">Academic Management System • V18 Cloud • {data["analysis_term"].upper() if data is not None else "Learning Centre"}</div>',
+    f'<div class="app-subtitle">Academic Management System • V19 • {data["analysis_term"].upper() if data is not None else "Learning Centre"}</div>',
     unsafe_allow_html=True
 )
 
@@ -1829,7 +1776,7 @@ elif page == "Students":
         st.success("Class teacher comment saved for this student.")
 
     st.markdown("### 📅 Report issue date")
-    st.caption("Choose the date that should appear below the teacher and principal signatures. You can change it for each report as needed.")
+    st.caption("Choose the date that should appear below the teacher and principal signatures.")
     report_date = st.date_input(
         "Report date",
         value=st.session_state.get("report_issue_date", date.today()),
@@ -1890,7 +1837,6 @@ elif page == "Student Records":
                 new_admission = st.text_input("Admission / Student ID", value=str(current[admission_col]), key="record_edit_admission")
             else:
                 new_admission = None
-                st.info("No admission-number column was detected in this Excel file.")
 
         st.markdown("### Term averages")
         avg_inputs = {}
@@ -1916,7 +1862,7 @@ elif page == "Student Records":
             st.session_state.raw_data = working
             st.session_state.data = prepare_data(working, data["analysis_term"])
             save_results_store(working)
-            st.success(f"Updated {new_name.strip() or edit_name}. Rankings recalculated and saved to cloud.")
+            st.success(f"Updated {new_name.strip() or edit_name}. Saved to cloud.")
             st.rerun()
 
     with tab_add:
@@ -1954,8 +1900,8 @@ elif page == "Student Records":
     with tab_delete:
         st.markdown("### Remove a student")
         delete_name = st.selectbox("Select student to remove", working[raw_name_col].astype(str).tolist(), key="delete_student_name")
-        st.warning("Removing a student changes the working data. Your original Excel file is not overwritten automatically.")
-        confirm_delete = st.checkbox("I understand that this student will be removed from the working dataset.", key="confirm_delete_student")
+        st.warning("Removing a student changes the working data.")
+        confirm_delete = st.checkbox("I understand this student will be removed.", key="confirm_delete_student")
         if st.button("🗑️ Remove Student", type="secondary", disabled=not confirm_delete, use_container_width=True, key="remove_student_button"):
             working = working[working[raw_name_col].astype(str) != delete_name].copy()
             st.session_state.raw_data = working
@@ -1966,7 +1912,7 @@ elif page == "Student Records":
 
     with tab_export:
         st.markdown("### Save your updated records")
-        st.info("Download the updated Excel file to keep a local backup copy.")
+        st.info("Download the updated Excel file to keep a local backup.")
         st.write(f"**Current students:** {len(working)}")
         st.write(f"**Current streams:** {working[raw_stream_col].nunique()}")
         excel_buffer = io.BytesIO()
@@ -1986,7 +1932,7 @@ elif page == "Student Records":
 
 elif page == "Academic Results":
     st.subheader("📝 Academic Results Entry & Editing")
-    st.caption("Enter or correct subject marks. Rankings are recalculated and saved to the cloud.")
+    st.caption("Enter or correct subject marks. Changes are saved to the cloud.")
 
     raw_df = st.session_state.get("raw_data")
     if raw_df is None or raw_df.empty:
@@ -2056,7 +2002,7 @@ elif page == "Academic Results":
         st.session_state.raw_data = working
         st.session_state.data = prepare_data(working, data["analysis_term"])
         save_results_store(working)
-        st.success(f"Saved {term_choice.upper()} results for {selected_result_student}. Average: {proposed_average:.1f}%. Saved to cloud.")
+        st.success(f"Saved {term_choice.upper()} results. Average: {proposed_average:.1f}%. Saved to cloud.")
         st.rerun()
 
     st.markdown("### 📊 Current subject results")
@@ -2319,13 +2265,9 @@ elif page == "Learning Centre":
                 else:
                     saved_name=""; saved_path=""
                     if file is not None:
+                        import base64
                         safe=re.sub(r"[^A-Za-z0-9._-]+", "_", file.name)
                         saved_name=safe
-                        # Store the file content directly in the database
-                        file_content = file.getbuffer().tobytes().hex()
-                        saved_path = file_content[:500]
-                        # Store the actual file bytes in a simple base64-like approach
-                        import base64
                         file_b64 = base64.b64encode(file.getbuffer()).decode('utf-8')
                         saved_path = "BASE64::" + file_b64
                     add_material(title.strip(),mtype,subject.strip(),target_stream,description.strip(),
@@ -2721,26 +2663,23 @@ elif page == "Settings":
     with tab_password:
         st.write("### Change your password")
         st.caption(f"Signed in as: **{st.session_state.username}** ({st.session_state.user_role})")
-        if st.session_state.user_role == "admin":
-            st.info("The admin account uses fixed credentials in code. To change, edit them in app.py.")
-        else:
-            old_pw = st.text_input("Current password", type="password", key="pw_old")
-            new_pw = st.text_input("New password", type="password", key="pw_new")
-            confirm_pw = st.text_input("Confirm new password", type="password", key="pw_confirm")
-            if st.button("Update Password", type="primary", use_container_width=True):
-                if not old_pw or not new_pw or not confirm_pw:
-                    st.error("Fill in all fields.")
-                elif new_pw != confirm_pw:
-                    st.error("New passwords do not match.")
-                elif len(new_pw) < 6:
-                    st.error("Password must be at least 6 characters.")
+        old_pw = st.text_input("Current password", type="password", key="pw_old")
+        new_pw = st.text_input("New password", type="password", key="pw_new")
+        confirm_pw = st.text_input("Confirm new password", type="password", key="pw_confirm")
+        if st.button("Update Password", type="primary", use_container_width=True):
+            if not old_pw or not new_pw or not confirm_pw:
+                st.error("Fill in all fields.")
+            elif new_pw != confirm_pw:
+                st.error("New passwords do not match.")
+            elif len(new_pw) < 6:
+                st.error("Password must be at least 6 characters.")
+            else:
+                user = authenticate_user(st.session_state.username, old_pw)
+                if not user:
+                    st.error("Current password is incorrect.")
                 else:
-                    user = authenticate_user(st.session_state.username, old_pw)
-                    if not user:
-                        st.error("Current password is incorrect.")
-                    else:
-                        change_user_password(st.session_state.username, new_pw)
-                        st.success("Password updated.")
+                    change_user_password(st.session_state.username, new_pw)
+                    st.success("Password updated.")
 
     with tab_parents:
         st.caption("Link a parent account to one or more student names. Use | between multiple children.")
