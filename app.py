@@ -258,6 +258,72 @@ def change_user_password(username, new_password):
     }).eq("username", username).execute()
 
 
+def create_or_update_teacher(username, full_name, password):
+    hashed = hash_password(password)
+    existing = supabase.table("users").select("username").eq("username", username).execute()
+    if existing.data:
+        supabase.table("users").update({
+            "password": hashed, "role": "teacher",
+            "student_name": full_name
+        }).eq("username", username).execute()
+    else:
+        supabase.table("users").insert({
+            "username": username, "password": hashed,
+            "role": "teacher", "student_name": full_name
+        }).execute()
+
+
+def get_teachers():
+    try:
+        result = supabase.table("users").select("username,student_name").eq("role", "teacher").order("username").execute()
+        return result.data or []
+    except Exception:
+        return []
+
+
+def delete_teacher(username):
+    try:
+        supabase.table("users").delete().eq("username", username).eq("role", "teacher").execute()
+    except Exception:
+        pass
+    supabase.table("users").update({
+        "password": hash_password(new_password)
+    }).eq("username", username).execute()
+
+
+def create_or_update_teacher(username, full_name, password):
+    hashed = hash_password(password)
+    existing = supabase.table("users").select("username").eq("username", username).execute()
+    if existing.data:
+        supabase.table("users").update({
+            "password": hashed, "role": "teacher",
+            "student_name": full_name
+        }).eq("username", username).execute()
+    else:
+        supabase.table("users").insert({
+            "username": username, "password": hashed,
+            "role": "teacher", "student_name": full_name
+        }).execute()
+
+
+def get_teachers():
+    try:
+        result = supabase.table("users").select("username,student_name").eq("role", "teacher").order("username").execute()
+        return result.data or []
+    except Exception:
+        return []
+
+
+def delete_teacher(username):
+    try:
+        supabase.table("users").delete().eq("username", username).eq("role", "teacher").execute()
+    except Exception:
+        pass
+    supabase.table("users").update({
+        "password": hash_password(new_password)
+    }).eq("username", username).execute()
+
+
 def save_results_store(raw_df):
     try:
         records = raw_df.fillna("").to_dict(orient="records")
@@ -1896,6 +1962,7 @@ elif page == "Student Records":
                 val = float(current[col])
             except Exception:
                 val = 0.0
+            val = max(0.0, min(100.0, val))
             avg_inputs[col] = avg_grid[i % 3].number_input(str(col).upper(), min_value=0.0, max_value=100.0, value=val, step=0.1, key=f"record_avg_{edit_idx}_{col}")
 
         if st.button("💾 Save Student Changes", type="primary", use_container_width=True, key="save_student_changes"):
@@ -2027,6 +2094,7 @@ elif page == "Academic Results":
     for i, col in enumerate(term_subjects):
         value = pd.to_numeric(current[col], errors="coerce")
         value = 0.0 if pd.isna(value) else float(value)
+        value = max(0.0, min(100.0, value))
         score_inputs[col] = grid[i % 3].number_input(
             clean_label(col), min_value=0.0, max_value=100.0, value=value, step=1.0,
             key=f"result_score_{idx}_{term_choice}_{col}",
@@ -2666,9 +2734,10 @@ elif page == "My Profile":
 elif page == "Settings":
     st.subheader("School Profile & System Settings")
 
-    tab_profile, tab_password, tab_parents, tab_students, tab_backup = st.tabs([
+    tab_profile, tab_password, tab_teachers, tab_parents, tab_students, tab_backup = st.tabs([
         "🏫 School Profile",
         "🔒 Change Password",
+        "👨‍🏫 Teacher Accounts",
         "👨‍👩‍👧 Parent Accounts",
         "🎓 Student Accounts",
         "💾 Backup & Data"
@@ -2749,6 +2818,52 @@ elif page == "Settings":
                 else:
                     change_user_password(st.session_state.username, new_pw)
                     st.success("Password updated.")
+
+    with tab_teachers:
+        st.caption("Create and manage teacher accounts. Each teacher gets their own username and password.")
+        teachers = get_teachers()
+        if teachers:
+            df_teachers = pd.DataFrame(teachers)
+            df_teachers.columns = ["Username", "Full Name"]
+            st.dataframe(df_teachers, use_container_width=True, hide_index=True)
+
+        t1, t2 = st.columns(2)
+        with t1:
+            teacher_username = st.text_input("Teacher username", placeholder="e.g. mr.kamau", key="new_teacher_username")
+            teacher_full_name = st.text_input("Teacher full name", placeholder="e.g. Mr. Peter Kamau", key="new_teacher_full_name")
+        with t2:
+            teacher_password = st.text_input("Teacher password", type="password", key="new_teacher_password")
+            st.caption("Password should be at least 6 characters.")
+
+        tb1, tb2 = st.columns(2)
+        with tb1:
+            if st.button("➕ Create / Update Teacher", type="primary", use_container_width=True, key="create_teacher_btn"):
+                if not teacher_username.strip() or not teacher_full_name.strip() or not teacher_password.strip():
+                    st.error("Enter username, full name and password.")
+                elif len(teacher_password) < 6:
+                    st.error("Password must be at least 6 characters.")
+                else:
+                    try:
+                        create_or_update_teacher(teacher_username.strip(), teacher_full_name.strip(), teacher_password)
+                        st.success(f"Teacher '{teacher_username.strip()}' saved. Share the username and password with them.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+        with tb2:
+            with st.expander("🗑️ Delete a teacher"):
+                if teachers:
+                    delete_options = [t["username"] for t in teachers]
+                    selected_delete = st.selectbox("Select teacher to delete", delete_options, key="delete_teacher_select")
+                    confirm_del = st.checkbox("I understand this will remove the teacher account.", key="confirm_delete_teacher")
+                    if st.button("Delete Teacher", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_teacher_btn"):
+                        try:
+                            delete_teacher(selected_delete)
+                            st.success(f"Deleted {selected_delete}.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+                else:
+                    st.info("No teachers to delete.")
 
     with tab_parents:
         st.caption("Link a parent account to one or more student names. Use | between multiple children.")
