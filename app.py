@@ -648,15 +648,19 @@ def prepare_data(raw_df, selected_term):
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
     subjects = [
-        c for c in df.columns
-        if selected_term in c
-        and c != target
-        and "avg" not in c
-        and c not in [name_col, stream_col]
+            c for c in df.columns
+            if selected_term in c
+            and c != target
+            and "avg" not in c
+            and "total" not in c
+            and c not in [name_col, stream_col]
     ]
 
     if not subjects:
         excluded = set(avg_cols + [name_col, stream_col])
+        for col in df.columns:
+            if "total" in str(col).lower():
+                excluded.add(col)
         subjects = [
             c for c in df.columns
             if c not in excluded and pd.api.types.is_numeric_dtype(df[c])
@@ -706,15 +710,57 @@ def school_statistics(data):
 
 
 def grade(score):
+    """Return the KCSE-style letter grade for a percentage/average."""
     if score >= 80:
         return "A"
+    if score >= 75:
+        return "A-"
     if score >= 70:
+        return "B+"
+    if score >= 65:
         return "B"
     if score >= 60:
-        return "C"
+        return "B-"
+    if score >= 55:
+        return "C+"
     if score >= 50:
+        return "C"
+    if score >= 45:
+        return "C-"
+    if score >= 40:
+        return "D+"
+    if score >= 35:
         return "D"
+    if score >= 30:
+        return "D-"
     return "E"
+
+
+def grade_points(score):
+    """Return the KCSE points (1-12) for a percentage/average."""
+    if score >= 80:
+        return 12
+    if score >= 75:
+        return 11
+    if score >= 70:
+        return 10
+    if score >= 65:
+        return 9
+    if score >= 60:
+        return 8
+    if score >= 55:
+        return 7
+    if score >= 50:
+        return 6
+    if score >= 45:
+        return 5
+    if score >= 40:
+        return 4
+    if score >= 35:
+        return 3
+    if score >= 30:
+        return 2
+    return 1
 
 
 def result_summary(scores):
