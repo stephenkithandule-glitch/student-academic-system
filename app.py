@@ -1053,7 +1053,7 @@ def generate_master_pdf(data, school_name):
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=landscape(letter),
-        leftMargin=20, rightMargin=20, topMargin=25, bottomMargin=25
+        leftMargin=18, rightMargin=18, topMargin=14, bottomMargin=14
     )
     styles = pdf_styles()
     df = data["df"]
@@ -1096,7 +1096,6 @@ def generate_master_pdf(data, school_name):
     doc.build(story)
     buf.seek(0)
     return buf
-
 
 def _find_admission_col(data):
     df = data["df"]
@@ -1150,10 +1149,12 @@ def generate_student_pdf(student, data, school_name, class_comment=None, report_
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=landscape(letter),
-        leftMargin=28, rightMargin=28, topMargin=22, bottomMargin=28
+        leftMargin=14, rightMargin=14, topMargin=12, bottomMargin=12
     )
     styles = pdf_styles()
-    name = str(student[data["name_col"]])
+    name = str(student[data["name_col"]]).strip()
+    if not name or name.lower() == "nan":
+        name = "(Name not found)"
     stream = str(student[data["stream_col"]])
     target = data["target_rank_col"]
     score = float(student[target])
@@ -1275,9 +1276,9 @@ def generate_student_pdf(student, data, school_name, class_comment=None, report_
         ("PADDING", (0, 0), (-1, -1), 3),
     ]))
 
-    img1 = Image(figure_bytes(progression_figure(student, data)), width=3.55*inch, height=1.55*inch)
-    img2 = Image(figure_bytes(subject_figure(student, data)), width=3.55*inch, height=1.55*inch)
-    charts = Table([[img1, img2]], colWidths=[3.7*inch, 3.7*inch])
+    img1 = Image(figure_bytes(progression_figure(student, data)), width=3.1*inch, height=1.35*inch)
+    img2 = Image(figure_bytes(subject_figure(student, data)), width=3.1*inch, height=1.35*inch)
+    charts = Table([[img1, img2]], colWidths=[3.3*inch, 3.3*inch])
     charts.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
 
     summary_box = Table([
@@ -1294,14 +1295,14 @@ def generate_student_pdf(student, data, school_name, class_comment=None, report_
         ("PADDING", (0, 0), (-1, -1), 5),
     ]))
 
-    lower = Table([[history_table, charts, summary_box]], colWidths=[2.35*inch, 7.55*inch, 2.75*inch])
+    lower = Table([[history_table, charts, summary_box]], colWidths=[2.2*inch, 6.8*inch, 2.65*inch])
     lower.setStyle(TableStyle([
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
         ("LEFTPADDING", (0, 0), (-1, -1), 2),
         ("RIGHTPADDING", (0, 0), (-1, -1), 2),
     ]))
     story.append(lower)
-    story.append(Spacer(1, 7))
+    story.append(Spacer(1, 4))
 
     teacher_sig = st.session_state.get("teacher_signature")
     principal_sig = st.session_state.get("principal_signature")
