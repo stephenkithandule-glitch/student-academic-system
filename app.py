@@ -1337,9 +1337,9 @@ st.markdown(
 )
 
 if st.session_state.user_role == "student":
-    nav_items = ["My Dashboard", "Learning Centre", "Online Tests & Quizzes", "My Profile"]
+    nav_items = ["My Dashboard", "Learning Centre", "Online Tests & Quizzes", "My Profile", "Change Password"]
 elif st.session_state.user_role == "parent":
-    nav_items = ["Parent Portal"]
+    nav_items = ["Parent Portal", "Change Password"]
 elif st.session_state.user_role == "teacher":
     nav_items = ["Dashboard", "Students", "Academic Results", "Streams", "Master Merit List", "Reports", "Learning Centre", "Online Tests & Quizzes", "Settings"]
 else:
@@ -2577,6 +2577,29 @@ elif page == "Online Tests & Quizzes":
 # ============================================================
 # MY PROFILE
 # ============================================================
+
+elif page == "Change Password":
+    st.subheader("🔒 Change Your Password")
+    st.caption(f"Signed in as: **{st.session_state.username}**")
+
+    old_pw = st.text_input("Current password", type="password", key="user_cp_old")
+    new_pw = st.text_input("New password", type="password", key="user_cp_new")
+    confirm_pw = st.text_input("Confirm new password", type="password", key="user_cp_confirm")
+
+    if st.button("Update Password", type="primary", use_container_width=True, key="user_cp_button"):
+        if not old_pw or not new_pw or not confirm_pw:
+            st.error("Fill in all fields.")
+        elif new_pw != confirm_pw:
+            st.error("New passwords do not match.")
+        elif len(new_pw) < 6:
+            st.error("New password must be at least 6 characters.")
+        else:
+            user = authenticate_user(st.session_state.username, old_pw)
+            if not user:
+                st.error("Current password is incorrect.")
+            else:
+                change_user_password(st.session_state.username, new_pw)
+                st.success("Password updated successfully. Use the new password next time you sign in.")
 
 elif page == "My Profile":
     st.subheader("👤 My Student Profile")
