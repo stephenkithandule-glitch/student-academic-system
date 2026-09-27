@@ -546,7 +546,83 @@ def quiz_grade(score, total):
 # ============================================================
 # BACKUP
 # ============================================================
+def load_school_settings():
+    """Load school branding/settings from Supabase and apply to session state."""
+    try:
+        result = supabase.table("school_settings").select("*").eq("id", 1).execute()
+        if not result.data:
+            return
+        s = result.data[0]
 
+        # Text fields — only apply if present (non-empty)
+        if s.get("school_name"):
+            st.session_state.school_name = s["school_name"]
+        if s.get("school_address") is not None:
+            st.session_state.school_address = s["school_address"] or ""
+        if s.get("school_phone") is not None:
+            st.session_state.school_phone = s["school_phone"] or ""
+        if s.get("school_email") is not None:
+            st.session_state.school_email = s["school_email"] or ""
+        if s.get("academic_year"):
+            st.session_state.academic_year = s["academic_year"]
+        if s.get("current_term"):
+            st.session_state.current_term = s["current_term"]
+        if s.get("class_teacher_name"):
+            st.session_state.class_teacher_name = s["class_teacher_name"]
+        if s.get("principal_name"):
+            st.session_state.principal_name = s["principal_name"]
+        if s.get("principal_comment"):
+            st.session_state.principal_comment = s["principal_comment"]
+
+        # Images — base64 encoded
+        if s.get("logo_base64"):
+            try:
+                st.session_state.school_logo = base64.b64decode(s["logo_base64"])
+            except Exception:
+                pass
+        if s.get("teacher_signature_base64"):
+            try:
+                st.session_state.teacher_signature = base64.b64decode(s["teacher_signature_base64"])
+            except Exception:
+                pass
+        if s.get("principal_signature_base64"):
+            try:
+                st.session_state.principal_signature = base64.b64decode(s["principal_signature_base64"])
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+
+def save_school_settings():
+    """Write current session_state branding/settings into Supabase."""
+    def _b64(data):
+        if not data:
+            return None
+        try:
+            return base64.b64encode(data).decode("utf-8")
+        except Exception:
+            return None
+
+    payload = {
+        "school_name": st.session_state.get("school_name", ""),
+        "school_address": st.session_state.get("school_address", ""),
+        "school_phone": st.session_state.get("school_phone", ""),
+        "school_email": st.session_state.get("school_email", ""),
+        "academic_year": st.session_state.get("academic_year", ""),
+        "current_term": st.session_state.get("current_term", ""),
+        "class_teacher_name": st.session_state.get("class_teacher_name", ""),
+        "principal_name": st.session_state.get("principal_name", ""),
+        "principal_comment": st.session_state.get("principal_comment", ""),
+        "logo_base64": _b64(st.session_state.get("school_logo")),
+        "teacher_signature_base64": _b64(st.session_state.get("teacher_signature")),
+        "principal_signature_base64": _b64(st.session_state.get("principal_signature")),
+        "updated_at": datetime.now().isoformat(),
+    }
+    try:
+        supabase.table("school_settings").update(payload).eq("id", 1).execute()
+    except Exception as e:
+        st.warning(f"Could not save settings to cloud: {e}")
 def create_backup_zip():
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -1279,7 +1355,10 @@ defaults = {
 }
 for key, value in defaults.items():
     if key not in st.session_state:
-        st.session_state[key] = value
+        st.session_state[key] = value# Load persisted school settings from Supabase (once per session)
+if not st.session_state.get("_settings_loaded"):
+    load_school_settings()
+    st.session_state["_settings_loaded"] = True
 
 # ============================================================
 # LOGIN SCREEN
@@ -2926,7 +3005,8 @@ elif page == "Settings":
                 st.session_state.teacher_signature = teacher_sig.getvalue()
             if principal_sig is not None:
                 st.session_state.principal_signature = principal_sig.getvalue()
-            st.success("Saved.")
+            save_school_settings()
+            st.success("✅ Saved to cloud. These settings will persist across restarts.")
 
     with tab_password:
         st.write("### Change your password")
