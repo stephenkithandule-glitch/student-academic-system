@@ -83,7 +83,26 @@ div[data-testid="stMetric"] {
 """, unsafe_allow_html=True)
 
 DEFAULT_SCHOOL = "EXCELLENCE SECONDARY SCHOOL"
-TERMS = ["y1t1", "y1t2", "y1t3", "y2t1", "y2t2", "y2t3"]
+import re as _re_module
+
+def detect_terms_from_columns(columns):
+    """Scan columns and return a sorted list of unique terms like ['y1t1','y1t2','y2t3','y3t1',...]."""
+    pattern = _re_module.compile(r"^(y\d+t\d+)")
+    found = set()
+    for col in columns:
+        col_lower = str(col).lower().strip()
+        match = pattern.match(col_lower)
+        if match:
+            found.add(match.group(1))
+    # Sort: first by year, then by term
+    def sort_key(t):
+        m = _re_module.match(r"y(\d+)t(\d+)", t)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+        return (0, 0)
+    return sorted(found, key=sort_key)
+
+TERMS = ["y1t1", "y1t2", "y1t3", "y2t1", "y2t2", "y2t3"]  # fallback default
 
 
 # ============================================================
@@ -557,6 +576,25 @@ def clean_label(value):
     return value.replace("_", " ").replace("-", " ").title()
 
 
+def detect_terms_from_columns(columns):
+    """Scan columns and return a sorted list of unique terms like ['y1t1','y1t2','y2t3','y3t1',...]."""
+    pattern = re.compile(r"^(y\d+t\d+)")
+    found = set()
+    for col in columns:
+        col_lower = str(col).lower().strip()
+        match = pattern.match(col_lower)
+        if match:
+            found.add(match.group(1))
+
+    def sort_key(t):
+        m = re.match(r"y(\d+)t(\d+)", t)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+        return (0, 0)
+
+    return sorted(found, key=sort_key)
+
+
 def detect_columns(raw_df):
     df = raw_df.copy()
     df.columns = df.columns.astype(str).str.strip().str.lower()
@@ -575,14 +613,18 @@ def detect_columns(raw_df):
 
     df[stream_col] = df[stream_col].astype(str).str.strip().str.upper()
 
+    detected_terms = detect_terms_from_columns(df.columns)
+    if not detected_terms:
+        detected_terms = TERMS
+
     avg_cols = []
-    for term in TERMS:
+    for term in detected_terms:
         candidates = [c for c in df.columns if term in c and "avg" in c and "total" not in c]
         if not candidates:
             candidates = [c for c in df.columns if term in c and "total" not in c]
         avg_cols.append(candidates[0] if candidates else None)
 
-    pairs = [(t, c) for t, c in zip(TERMS, avg_cols) if c is not None]
+    pairs = [(t, c) for t, c in zip(detected_terms, avg_cols) if c is not None]
     return (
         df,
         name_col,
@@ -1356,19 +1398,14 @@ if st.session_state.data is None and st.session_state.user_role not in ["student
         '<div class="app-subtitle">Upload your student_results.xlsx file from the left menu to begin.</div>',
         unsafe_allow_html=True
     )
-    st.info(
-        "Expected columns include Name, Stream/Class, term averages such as "
-        "y1t1avg through y2t3avg, and subject columns such as y2t3maths."
-    )
-    a, b, c = st.columns(3)
-    a.metric("Dashboard", "School overview")
-    b.metric("Student Reports", "Individual analysis")
-    c.metric("PDF Reports", "Ready to download")
+
     st.markdown("### First-time setup")
-    st.write("1. Upload the Excel file.")
+    st.write("1. Upload the Excel file using the button on the left.")
     st.write("2. Choose the analysis term.")
     st.write("3. Click **Load / Analyse Results**.")
-    st.write("4. Use the navigation menu to explore the system.")
+    st.write("4. For the Excel format guide, go to **Settings → 📄 Excel Format Guide**.")
+
+  
     st.stop()
 
 
@@ -2826,15 +2863,16 @@ elif page == "My Profile":
 elif page == "Settings":
     st.subheader("School Profile & System Settings")
 
-    tab_profile, tab_password, tab_teachers, tab_parents, tab_students, tab_backup = st.tabs([
-        "🏫 School Profile",
-        "🔒 Change Password",
-        "👨‍🏫 Teacher Accounts",
-        "👨‍👩‍👧 Parent Accounts",
-        "🎓 Student Accounts",
-        "💾 Backup & Data"
-    ])
-
+    tab_profile, tab_password, tab_teachers, tab_parents, tab_students, tab_format, tab_backup = st.tabs([
+    "🏫 School Profile",
+    "🔒 Change Password",
+    "👨‍🏫 Teacher Accounts",
+    "👨‍👩‍👧 Parent Accounts",
+    "🎓 Student Accounts",
+    "📄 Excel Format Guide",
+    "💾 Backup & Data"
+])
+        
     with tab_profile:
         left, right = st.columns(2)
         with left:
@@ -3011,6 +3049,96 @@ elif page == "Settings":
                     st.rerun()
                 except Exception as e:
                     st.error(f"Error: {e}")
+
+    with tab_format:
+        st.subheader("📄 Excel Format Guide")
+        st.caption("The exact columns your student_results.xlsx must contain for the app to read it correctly.")
+
+        st.markdown("### 1️⃣ Identity Columns (required)")
+        st.markdown("""
+| Column name | Example | Notes |
+|---|---|---|
+| `name` | JOHN MWANGI | Student's full name — must match parent/student account links |
+| `stream` | FORM 2 EAST | Class / stream |
+| `admission number` | 1234 | Student ID (optional but recommended) |
+""")
+
+        st.markdown("### 2️⃣ Term Columns (required for each term you want to track)")
+        st.markdown("""
+For **every term**, the app expects 3 types of columns:
+
+| Column type | Pattern | Example | Meaning |
+|---|---|---|---|
+| Term average | `yXtY_avg` | `y2t3_avg` | Average score for Year 2, Term 3 |
+| Term total | `yXtYtotals` | `y2t3totals` | Total marks for that term |
+| Subject mark | `yXtY<subject>` | `y2t3maths` | Individual subject score |
+
+**Rule:** `X` = year number, `Y` = term number. So:
+- `y1t1` = Year 1, Term 1
+- `y2t3` = Year 2, Term 3
+- `y3t1` = Year 3, Term 1 (auto-detected!)
+""")
+
+        st.markdown("### 3️⃣ Example header row")
+        st.code(
+            "name | stream | admission number | "
+            "y1t1maths | y1t1english | y1t1biology | y1t1totals | y1t1_avg | "
+            "y1t2maths | y1t2english | y1t2biology | y1t2totals | y1t2_avg | "
+            "y2t1maths | y2t1english | y2t1biology | y2t1totals | y2t1_avg",
+            language="text"
+        )
+
+        st.markdown("### 4️⃣ Full example (one student row)")
+        st.code(
+            "JOHN MWANGI | FORM 2 EAST | 1234 | "
+            "72 | 68 | 75 | 215 | 71.7 | "
+            "78 | 74 | 80 | 232 | 77.3 | "
+            "82 | 78 | 85 | 245 | 81.7",
+            language="text"
+        )
+
+        st.info(
+            "💡 **Tip:** Subject names can be anything — `maths`, `math`, `mathematics` — "
+            "the app displays whatever you type."
+        )
+
+        st.divider()
+        st.markdown("### 📥 Download Excel Template")
+        st.write("Get a ready-to-fill Excel file with all the correct column names.")
+
+        if st.button("📄 Prepare Excel Template", type="primary"):
+            template_data = {
+                "name": ["JOHN MWANGI", "MARY NJERI"],
+                "stream": ["FORM 2 EAST", "FORM 1 WEST"],
+                "admission number": ["1234", "1235"],
+                "y1t1maths": [72, 68],
+                "y1t1english": [68, 74],
+                "y1t1biology": [75, 78],
+                "y1t1totals": [215, 220],
+                "y1t1_avg": [71.7, 73.3],
+                "y1t2maths": [78, 70],
+                "y1t2english": [74, 76],
+                "y1t2biology": [80, 82],
+                "y1t2totals": [232, 228],
+                "y1t2_avg": [77.3, 76.0],
+                "y2t1maths": [82, 74],
+                "y2t1english": [78, 78],
+                "y2t1biology": [85, 80],
+                "y2t1totals": [245, 232],
+                "y2t1_avg": [81.7, 77.3],
+            }
+            template_df = pd.DataFrame(template_data)
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                template_df.to_excel(writer, index=False, sheet_name="Student Results")
+            buf.seek(0)
+            st.download_button(
+                "⬇️ Download Excel Template",
+                data=buf.getvalue(),
+                file_name="Student_Results_Template.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True
+            )
 
     with tab_backup:
         st.write("### Download a full backup")
