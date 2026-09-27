@@ -5,6 +5,7 @@ import hashlib
 import secrets
 import os
 import json
+import base64
 from datetime import datetime, date
 
 import numpy as np
@@ -38,13 +39,11 @@ h1, h2, h3, h4, h5, h6 {
     padding-bottom: .30rem !important;
     margin-top: .45rem !important;
     margin-bottom: .65rem !important;
-    overflow: visible !important;
 }
 .welcome-title {
     line-height: 1.35 !important;
     padding: .55rem .25rem .75rem .25rem !important;
     margin: .20rem 0 .90rem 0 !important;
-    overflow: visible !important;
 }
 [data-testid="stAppViewContainer"] .main .block-container {
     padding-top: 2rem !important;
@@ -53,37 +52,15 @@ h1, h2, h3, h4, h5, h6 {
 label, .stMarkdown, .stText, p {
     line-height: 1.45 !important;
 }
-</style>
-""", unsafe_allow_html=True)
-
-
-st.markdown("""
-<style>
-.metric-card {
-    border-radius: 14px;
-    padding: 1rem 1.1rem;
-    border: 1px solid rgba(128,128,128,.22);
-    background: rgba(128,128,128,.06);
-    min-height: 105px;
-    margin-bottom: .5rem;
-}
-.metric-card .label {
-    font-size: .82rem;
-    font-weight: 600;
-    opacity: .72;
-    text-transform: uppercase;
-    letter-spacing: .04em;
-}
-.metric-card .value {
-    font-size: 1.65rem;
-    font-weight: 750;
-    margin-top: .25rem;
-}
-.section-title {
-    font-size: 1.25rem;
-    font-weight: 750;
-    margin-top: 1rem;
-    margin-bottom: .5rem;
+.block-container {padding-top: 3rem; padding-bottom: 2rem;}
+.app-title {font-size: 2rem; font-weight: 750; margin-bottom: 0;}
+.app-subtitle {color:#6b7280; margin-top:2px; margin-bottom:18px;}
+.section-title {font-size:1.15rem; font-weight:700; margin-top:12px;}
+div[data-testid="stMetric"] {
+    border: 1px solid #e5e7eb;
+    border-radius: 12px;
+    padding: 10px 14px;
+    background: #ffffff;
 }
 .school-banner {
     border-radius: 16px;
@@ -102,19 +79,16 @@ st.markdown("""
     opacity: .72;
     margin-top: .15rem;
 }
-div[data-testid="stMetric"] {
-    border-radius: 14px;
-    padding: .75rem;
-}
 </style>
 """, unsafe_allow_html=True)
 
 DEFAULT_SCHOOL = "EXCELLENCE SECONDARY SCHOOL"
 TERMS = ["y1t1", "y1t2", "y1t3", "y2t1", "y2t2", "y2t3"]
 
-BACKUP_DIR = "system_backups"
-os.makedirs(BACKUP_DIR, exist_ok=True)
 
+# ============================================================
+# SUPABASE CLIENT
+# ============================================================
 
 def get_supabase_client() -> Client:
     url = st.secrets.get("SUPABASE_URL", "")
@@ -131,6 +105,10 @@ def get_supabase_client() -> Client:
 supabase = get_supabase_client()
 
 
+# ============================================================
+# PASSWORD HASHING
+# ============================================================
+
 def hash_password(password, salt=None):
     if salt is None:
         salt = secrets.token_hex(16)
@@ -146,6 +124,10 @@ def verify_password(password, stored):
     salt, hashed = stored.split("$", 1)
     return hash_password(password, salt) == f"{salt}${hashed}"
 
+
+# ============================================================
+# USER / AUTH
+# ============================================================
 
 def ensure_demo_users():
     try:
@@ -286,43 +268,11 @@ def delete_teacher(username):
         supabase.table("users").delete().eq("username", username).eq("role", "teacher").execute()
     except Exception:
         pass
-    supabase.table("users").update({
-        "password": hash_password(new_password)
-    }).eq("username", username).execute()
 
 
-def create_or_update_teacher(username, full_name, password):
-    hashed = hash_password(password)
-    existing = supabase.table("users").select("username").eq("username", username).execute()
-    if existing.data:
-        supabase.table("users").update({
-            "password": hashed, "role": "teacher",
-            "student_name": full_name
-        }).eq("username", username).execute()
-    else:
-        supabase.table("users").insert({
-            "username": username, "password": hashed,
-            "role": "teacher", "student_name": full_name
-        }).execute()
-
-
-def get_teachers():
-    try:
-        result = supabase.table("users").select("username,student_name").eq("role", "teacher").order("username").execute()
-        return result.data or []
-    except Exception:
-        return []
-
-
-def delete_teacher(username):
-    try:
-        supabase.table("users").delete().eq("username", username).eq("role", "teacher").execute()
-    except Exception:
-        pass
-    supabase.table("users").update({
-        "password": hash_password(new_password)
-    }).eq("username", username).execute()
-
+# ============================================================
+# RESULTS STORE
+# ============================================================
 
 def save_results_store(raw_df):
     try:
@@ -356,6 +306,10 @@ def load_results_store():
     except Exception:
         return None
 
+
+# ============================================================
+# LEARNING CENTRE
+# ============================================================
 
 def add_material(title, material_type, subject, target_stream, description,
                  deadline, file_name, file_path, external_link, uploaded_by):
@@ -430,6 +384,10 @@ def delete_material(material_id):
     except Exception:
         pass
 
+
+# ============================================================
+# QUIZZES
+# ============================================================
 
 def add_quiz(title, subject, target_stream, description, deadline,
              duration_minutes, created_by, questions):
@@ -507,7 +465,8 @@ def save_quiz_attempt(quiz_id, student_name, answers, score, total_points, statu
         "answers_json": json.dumps(answers),
         "score": float(score),
         "total_points": float(total_points),
-        "status": status
+        "status": status,
+        "manual_marks_json": "{}"
     }
     if existing.data:
         supabase.table("quiz_attempts").update({
@@ -515,7 +474,8 @@ def save_quiz_attempt(quiz_id, student_name, answers, score, total_points, statu
             "answers_json": json.dumps(answers),
             "score": float(score),
             "total_points": float(total_points),
-            "status": status
+            "status": status,
+            "manual_marks_json": "{}"
         }).eq("id", existing.data[0]["id"]).execute()
     else:
         supabase.table("quiz_attempts").insert(payload).execute()
@@ -526,6 +486,22 @@ def update_quiz_feedback(attempt_id, feedback, status='Reviewed'):
         "teacher_feedback": feedback.strip(),
         "status": status
     }).eq("id", attempt_id).execute()
+
+
+def save_manual_marks(attempt_id, manual_marks_dict):
+    supabase.table("quiz_attempts").update({
+        "manual_marks_json": json.dumps(manual_marks_dict)
+    }).eq("id", attempt_id).execute()
+
+
+def finalize_quiz_attempt(attempt_id, auto_score, manual_marks_dict, total_points):
+    total_manual = sum(float(v) for v in manual_marks_dict.values())
+    new_score = float(auto_score) + total_manual
+    supabase.table("quiz_attempts").update({
+        "score": new_score,
+        "status": "Reviewed"
+    }).eq("id", attempt_id).execute()
+    return new_score
 
 
 def delete_quiz(quiz_id):
@@ -548,6 +524,10 @@ def quiz_grade(score, total):
     return pct, grade(pct)
 
 
+# ============================================================
+# BACKUP
+# ============================================================
+
 def create_backup_zip():
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -563,95 +543,10 @@ def create_backup_zip():
     buf.seek(0)
     return buf
 
-st.markdown("""
-<style>
-.block-container {padding-top: 1.2rem; padding-bottom: 2rem;}
-.app-title {font-size: 2rem; font-weight: 750; margin-bottom: 0;}
-.app-subtitle {color:#6b7280; margin-top:2px; margin-bottom:18px;}
-.section-title {font-size:1.15rem; font-weight:700; margin-top:12px;}
-div[data-testid="stMetric"] {
-    border: 1px solid #e5e7eb;
-    border-radius: 12px;
-    padding: 10px 14px;
-    background: #ffffff;
-}
-</style>
-""", unsafe_allow_html=True)
 
-
-defaults = {
-    "logged_in": False,
-    "school_name": DEFAULT_SCHOOL,
-    "school_address": "",
-    "school_phone": "",
-    "school_email": "",
-    "academic_year": "2026",
-    "current_term": "Term 3",
-    "school_logo": None,
-    "class_teacher_name": "Class Teacher",
-    "principal_name": "Principal / Head Teacher",
-    "principal_comment": "Congratulations on your progress. Continue working hard and remain disciplined.",
-    "teacher_comments": {},
-    "teacher_signature": None,
-    "principal_signature": None,
-    "report_issue_date": date.today(),
-    "data": None,
-    "raw_data": None,
-    "raw_file_name": None,
-    "user_role": "",
-    "username": "",
-    "student_name": "",
-}
-for key, value in defaults.items():
-    if key not in st.session_state:
-        st.session_state[key] = value
-
-
-def login_screen():
-    st.markdown(
-        '<div class="app-title">Student Academic Management System</div>',
-        unsafe_allow_html=True
-    )
-    st.markdown(
-        '<div class="app-subtitle">Academic reporting + Learning Centre</div>',
-        unsafe_allow_html=True
-    )
-
-    left, center, right = st.columns([1, 1.4, 1])
-    with center:
-        role = st.selectbox("Login as", ["Administrator", "Teacher", "Student", "Parent"])
-        username = st.text_input("Username")
-        password = st.text_input("Password", type="password")
-
-        if st.button("Sign in", type="primary", use_container_width=True):
-            user = authenticate_user(username, password)
-            if user:
-                valid_role = (
-                    (role == "Administrator" and user["role"] == "admin")
-                    or (role == "Teacher" and user["role"] == "teacher")
-                    or (role == "Student" and user["role"] == "student")
-                    or (role == "Parent" and user["role"] == "parent")
-                )
-                if not valid_role:
-                    user = None
-            if user:
-                st.session_state.logged_in = True
-                st.session_state.user_role = user["role"]
-                st.session_state.username = user["username"]
-                st.session_state.student_name = user.get("student_name", "")
-                st.rerun()
-            else:
-                st.error("Incorrect username, password, or role.")
-
-        st.caption("Please sign in with your account credentials.")
-        st.info("All accounts are stored securely in Supabase with hashed passwords.")
-
-    st.stop()
-
-
-if not st.session_state.logged_in:
-    login_screen()
-
+# ============================================================
+# DATA PREPARATION
+# ============================================================
 
 def clean_label(value):
     value = str(value)
@@ -682,9 +577,9 @@ def detect_columns(raw_df):
 
     avg_cols = []
     for term in TERMS:
-        candidates = [c for c in df.columns if term in c and "avg" in c]
+        candidates = [c for c in df.columns if term in c and "avg" in c and "total" not in c]
         if not candidates:
-            candidates = [c for c in df.columns if term in c]
+            candidates = [c for c in df.columns if term in c and "total" not in c]
         avg_cols.append(candidates[0] if candidates else None)
 
     pairs = [(t, c) for t, c in zip(TERMS, avg_cols) if c is not None]
@@ -714,12 +609,12 @@ def prepare_data(raw_df, selected_term):
         df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
     subjects = [
-            c for c in df.columns
-            if selected_term in c
-            and c != target
-            and "avg" not in c
-            and "total" not in c
-            and c not in [name_col, stream_col]
+        c for c in df.columns
+        if selected_term in c
+        and c != target
+        and "avg" not in c
+        and "total" not in c
+        and c not in [name_col, stream_col]
     ]
 
     if not subjects:
@@ -735,14 +630,10 @@ def prepare_data(raw_df, selected_term):
     for subject in subjects:
         df[subject] = pd.to_numeric(df[subject], errors="coerce").fillna(0.0)
 
-    df["overall_rank"] = (
-        df[target].rank(ascending=False, method="min").astype(int)
-    )
-    df["stream_rank"] = (
-        df.groupby(stream_col)[target].rank(
-            ascending=False, method="min"
-        ).astype(int)
-    )
+    df["overall_rank"] = df[target].rank(ascending=False, method="min").astype(int)
+    df["stream_rank"] = df.groupby(stream_col)[target].rank(
+        ascending=False, method="min"
+    ).astype(int)
 
     if len(avg_cols) >= 2:
         previous = avg_cols[avg_cols.index(target) - 1]
@@ -776,56 +667,34 @@ def school_statistics(data):
 
 
 def grade(score):
-    """Return the KCSE-style letter grade for a percentage/average."""
-    if score >= 80:
-        return "A"
-    if score >= 75:
-        return "A-"
-    if score >= 70:
-        return "B+"
-    if score >= 65:
-        return "B"
-    if score >= 60:
-        return "B-"
-    if score >= 55:
-        return "C+"
-    if score >= 50:
-        return "C"
-    if score >= 45:
-        return "C-"
-    if score >= 40:
-        return "D+"
-    if score >= 35:
-        return "D"
-    if score >= 30:
-        return "D-"
+    """KCSE 12-point grading."""
+    if score >= 80: return "A"
+    if score >= 75: return "A-"
+    if score >= 70: return "B+"
+    if score >= 65: return "B"
+    if score >= 60: return "B-"
+    if score >= 55: return "C+"
+    if score >= 50: return "C"
+    if score >= 45: return "C-"
+    if score >= 40: return "D+"
+    if score >= 35: return "D"
+    if score >= 30: return "D-"
     return "E"
 
 
 def grade_points(score):
-    """Return the KCSE points (1-12) for a percentage/average."""
-    if score >= 80:
-        return 12
-    if score >= 75:
-        return 11
-    if score >= 70:
-        return 10
-    if score >= 65:
-        return 9
-    if score >= 60:
-        return 8
-    if score >= 55:
-        return 7
-    if score >= 50:
-        return 6
-    if score >= 45:
-        return 5
-    if score >= 40:
-        return 4
-    if score >= 35:
-        return 3
-    if score >= 30:
-        return 2
+    """KCSE 12-point scale (1-12)."""
+    if score >= 80: return 12
+    if score >= 75: return 11
+    if score >= 70: return 10
+    if score >= 65: return 9
+    if score >= 60: return 8
+    if score >= 55: return 7
+    if score >= 50: return 6
+    if score >= 45: return 5
+    if score >= 40: return 4
+    if score >= 35: return 3
+    if score >= 30: return 2
     return 1
 
 
@@ -841,30 +710,27 @@ def correlation_table(data):
     df = data["df"]
     target = data["target_rank_col"]
     rows = []
-
     for subject in data["subject_cols"]:
         x = df[subject]
         y = df[target]
-
         if x.nunique() <= 1 or y.nunique() <= 1:
-            corr = np.nan
-            slope = np.nan
-            intercept = np.nan
+            corr = np.nan; slope = np.nan; intercept = np.nan
         else:
             result = linregress(x, y)
             corr = x.corr(y)
             slope = result.slope
             intercept = result.intercept
-
         rows.append({
             "Subject": clean_label(subject),
             "Correlation (r)": corr,
             "Regression slope": slope,
             "Regression intercept": intercept,
         })
-
     return pd.DataFrame(rows)
 
+# ============================================================
+# CHARTS
+# ============================================================
 
 def progression_figure(student, data):
     values = [float(student[c]) for c in data["avg_cols"]]
@@ -920,33 +786,9 @@ def figure_bytes(fig):
     return buf
 
 
-def pdf_school_header(story, school_name, styles, report_subtitle):
-    logo = st.session_state.get("school_logo")
-    if logo:
-        try:
-            logo_buf = io.BytesIO(logo)
-            logo_img = Image(logo_buf, width=0.65*inch, height=0.65*inch)
-            header = Table([[logo_img, Paragraph(school_name, styles["title"])]],
-                           colWidths=[0.85*inch, 8.0*inch])
-            header.setStyle(TableStyle([
-                ("VALIGN", (0,0), (-1,-1), "MIDDLE"),
-                ("ALIGN", (1,0), (1,0), "CENTER"),
-            ]))
-            story.append(header)
-        except Exception:
-            story.append(Paragraph(school_name, styles["title"]))
-    else:
-        story.append(Paragraph(school_name, styles["title"]))
-    contact = " • ".join([x for x in [
-        st.session_state.get("school_address", ""),
-        st.session_state.get("school_phone", ""),
-        st.session_state.get("school_email", ""),
-    ] if x])
-    if contact:
-        story.append(Paragraph(contact, styles["meta"]))
-        story.append(Spacer(1, 2))
-    story.append(Paragraph(report_subtitle, styles["meta"]))
-
+# ============================================================
+# PDF HELPERS
+# ============================================================
 
 def pdf_styles():
     styles = getSampleStyleSheet()
@@ -976,6 +818,34 @@ def pdf_styles():
     }
 
 
+def pdf_school_header(story, school_name, styles, report_subtitle):
+    logo = st.session_state.get("school_logo")
+    if logo:
+        try:
+            logo_buf = io.BytesIO(logo)
+            logo_img = Image(logo_buf, width=0.65*inch, height=0.65*inch)
+            header = Table([[logo_img, Paragraph(school_name, styles["title"])]],
+                           colWidths=[0.85*inch, 8.0*inch])
+            header.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (1, 0), (1, 0), "CENTER"),
+            ]))
+            story.append(header)
+        except Exception:
+            story.append(Paragraph(school_name, styles["title"]))
+    else:
+        story.append(Paragraph(school_name, styles["title"]))
+    contact = " • ".join([x for x in [
+        st.session_state.get("school_address", ""),
+        st.session_state.get("school_phone", ""),
+        st.session_state.get("school_email", ""),
+    ] if x])
+    if contact:
+        story.append(Paragraph(contact, styles["meta"]))
+        story.append(Spacer(1, 2))
+    story.append(Paragraph(report_subtitle, styles["meta"]))
+
+
 def build_merit_table(frame, data, footer_label):
     styles = pdf_styles()
     name_col = data["name_col"]
@@ -1001,12 +871,10 @@ def build_merit_table(frame, data, footer_label):
                 text = str(int(value))
             else:
                 text = str(value)
-            out.append(
-                Paragraph(
-                    text,
-                    styles["cell"] if c == name_col else styles["center"]
-                )
-            )
+            out.append(Paragraph(
+                text,
+                styles["cell"] if c == name_col else styles["center"]
+            ))
         rows.append(out)
 
     footer = []
@@ -1017,20 +885,16 @@ def build_merit_table(frame, data, footer_label):
             text = f"{frame[c].mean():.1f}%"
         else:
             text = "-"
-        footer.append(
-            Paragraph(
-                text,
-                styles["cell"] if c == name_col else styles["center"]
-            )
-        )
+        footer.append(Paragraph(
+            text,
+            styles["cell"] if c == name_col else styles["center"]
+        ))
     rows.append(footer)
 
     fixed = 45 + 45 + 55
     available = 792 - 40
     name_width = 130
-    subject_width = max(
-        34, (available - name_width - fixed - 55) / max(1, len(subjects))
-    )
+    subject_width = max(34, (available - name_width - fixed - 55) / max(1, len(subjects)))
     widths = [name_width, 55, 45, 45, 55] + [subject_width] * len(subjects)
 
     table = Table(rows, colWidths=widths, repeatRows=1)
@@ -1097,6 +961,7 @@ def generate_master_pdf(data, school_name):
     buf.seek(0)
     return buf
 
+
 def _find_admission_col(data):
     df = data["df"]
     excluded = {data["name_col"], data["stream_col"]}
@@ -1111,14 +976,10 @@ def _find_admission_col(data):
 
 
 def _subject_comment(score):
-    if score >= 80:
-        return "Excellent"
-    if score >= 70:
-        return "Very good"
-    if score >= 60:
-        return "Good"
-    if score >= 50:
-        return "Satisfactory"
+    if score >= 80: return "Excellent"
+    if score >= 70: return "Very good"
+    if score >= 60: return "Good"
+    if score >= 50: return "Satisfactory"
     return "Needs improvement"
 
 
@@ -1180,9 +1041,9 @@ def generate_student_pdf(student, data, school_name, class_comment=None, report_
         f"STUDENT REPORT CARD | {data['analysis_term'].upper()} | "
         f"Academic Year {st.session_state.get('academic_year', '')}"
     )
-    story.append(Spacer(1, 5))
+    story.append(Spacer(1, 3))
     story.append(HRFlowable(width="100%", thickness=1.2, color=colors.HexColor("#263238")))
-    story.append(Spacer(1, 5))
+    story.append(Spacer(1, 3))
 
     info_style = ParagraphStyle(
         "Info", parent=styles["cell"], fontSize=8.5, leading=10
@@ -1209,13 +1070,13 @@ def generate_student_pdf(student, data, school_name, class_comment=None, report_
         ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#edf1f3")),
         ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c9d0d6")),
         ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 5),
-        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
-        ("TOPPADDING", (0, 0), (-1, -1), 5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]))
     story.append(identity_table)
-    story.append(Spacer(1, 7))
+    story.append(Spacer(1, 5))
 
     subject_rows = [[
         Paragraph("Subject", styles["header"]),
@@ -1252,15 +1113,15 @@ def generate_student_pdf(student, data, school_name, class_comment=None, report_
         ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7f9fa")]),
         ("LEFTPADDING", (0, 0), (-1, -1), 4),
         ("RIGHTPADDING", (0, 0), (-1, -1), 4),
-        ("TOPPADDING", (0, 0), (-1, -1), 3.5),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
     ]))
     story.append(Paragraph("Subject Performance", ParagraphStyle(
         "Section", parent=styles["cell"], fontName="Helvetica-Bold", fontSize=10, leading=12
     )))
-    story.append(Spacer(1, 3))
+    story.append(Spacer(1, 2))
     story.append(subject_table)
-    story.append(Spacer(1, 7))
+    story.append(Spacer(1, 5))
 
     term_rows = [[Paragraph("Term", styles["header"]), Paragraph("Average", styles["header"]), Paragraph("Grade", styles["header"])]]
     for term, avg_col in zip(data["target_terms"], data["avg_cols"]):
@@ -1279,7 +1140,10 @@ def generate_student_pdf(student, data, school_name, class_comment=None, report_
     img1 = Image(figure_bytes(progression_figure(student, data)), width=3.1*inch, height=1.35*inch)
     img2 = Image(figure_bytes(subject_figure(student, data)), width=3.1*inch, height=1.35*inch)
     charts = Table([[img1, img2]], colWidths=[3.3*inch, 3.3*inch])
-    charts.setStyle(TableStyle([("ALIGN", (0, 0), (-1, -1), "CENTER"), ("VALIGN", (0, 0), (-1, -1), "MIDDLE")]))
+    charts.setStyle(TableStyle([
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE")
+    ]))
 
     summary_box = Table([
         [Paragraph("Class Teacher Comment", info_header)],
@@ -1292,7 +1156,7 @@ def generate_student_pdf(student, data, school_name, class_comment=None, report_
         ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#edf1f3")),
         ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c9d0d6")),
         ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("PADDING", (0, 0), (-1, -1), 5),
+        ("PADDING", (0, 0), (-1, -1), 4),
     ]))
 
     lower = Table([[history_table, charts, summary_box]], colWidths=[2.2*inch, 6.8*inch, 2.65*inch])
@@ -1337,30 +1201,107 @@ def generate_all_student_pdfs(data, school_name):
     with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for _, student in data["df"].iterrows():
             pdf = generate_student_pdf(student, data, school_name)
-            safe = re.sub(
-                r"[^A-Za-z0-9_-]+", "_",
-                str(student[data["name_col"]])
-            ).strip("_")
-            archive.writestr(
-                f"Student_{safe}_Report.pdf",
-                pdf.getvalue()
-            )
+            safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(student[data["name_col"]])).strip("_")
+            archive.writestr(f"Student_{safe}_Report.pdf", pdf.getvalue())
     zip_buffer.seek(0)
     return zip_buffer
 
+
+# ============================================================
+# SESSION STATE
+# ============================================================
+
+defaults = {
+    "logged_in": False,
+    "school_name": DEFAULT_SCHOOL,
+    "school_address": "",
+    "school_phone": "",
+    "school_email": "",
+    "academic_year": "2026",
+    "current_term": "Term 3",
+    "school_logo": None,
+    "class_teacher_name": "Class Teacher",
+    "principal_name": "Principal / Head Teacher",
+    "principal_comment": "Congratulations on your progress. Continue working hard and remain disciplined.",
+    "teacher_comments": {},
+    "teacher_signature": None,
+    "principal_signature": None,
+    "report_issue_date": date.today(),
+    "data": None,
+    "raw_data": None,
+    "raw_file_name": None,
+    "user_role": "",
+    "username": "",
+    "student_name": "",
+    "active_quiz": None,
+}
+for key, value in defaults.items():
+    if key not in st.session_state:
+        st.session_state[key] = value
+
+# ============================================================
+# LOGIN SCREEN
+# ============================================================
+
+def login_screen():
+    st.markdown(
+        '<div class="app-title">Student Academic Management System</div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        '<div class="app-subtitle">Academic reporting + Learning Centre</div>',
+        unsafe_allow_html=True
+    )
+
+    left, center, right = st.columns([1, 1.4, 1])
+    with center:
+        role = st.selectbox("Login as", ["Administrator", "Teacher", "Student", "Parent"])
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+
+        if st.button("Sign in", type="primary", use_container_width=True):
+            user = authenticate_user(username, password)
+            if user:
+                valid_role = (
+                    (role == "Administrator" and user["role"] == "admin")
+                    or (role == "Teacher" and user["role"] == "teacher")
+                    or (role == "Student" and user["role"] == "student")
+                    or (role == "Parent" and user["role"] == "parent")
+                )
+                if not valid_role:
+                    user = None
+            if user:
+                st.session_state.logged_in = True
+                st.session_state.user_role = user["role"]
+                st.session_state.username = user["username"]
+                st.session_state.student_name = user.get("student_name", "")
+                st.rerun()
+            else:
+                st.error("Incorrect username, password, or role.")
+
+        st.caption("Please sign in with your account credentials.")
+        st.info("All accounts are stored securely in Supabase with hashed passwords.")
+
+    st.stop()
+
+
+if not st.session_state.logged_in:
+    login_screen()
+
+
+# ============================================================
+# SIDEBAR
+# ============================================================
+
 st.sidebar.title("Academic System")
-
 st.session_state.school_name = st.sidebar.text_input(
-    "School name",
-    value=st.session_state.school_name
+    "School name", value=st.session_state.school_name
 )
-
 st.sidebar.caption("School branding can be completed in Settings.")
 
 if st.session_state.user_role in ["admin", "teacher"]:
     uploaded = st.sidebar.file_uploader(
-        "Upload student Excel file",
-        type=["xlsx", "xls"]
+        "Upload student Excel file", type=["xlsx", "xls"]
     )
 else:
     uploaded = None
@@ -1369,14 +1310,10 @@ if uploaded:
     try:
         raw = pd.read_excel(uploaded)
         _, _, _, detected_terms, _ = detect_columns(raw)
-
         if detected_terms:
             selected_term = st.sidebar.selectbox(
-                "Analysis term",
-                detected_terms,
-                index=len(detected_terms) - 1
+                "Analysis term", detected_terms, index=len(detected_terms) - 1
             )
-
             if st.sidebar.button("Load / Analyse Results", type="primary", use_container_width=True):
                 st.session_state.raw_data = raw.copy()
                 st.session_state.data = prepare_data(raw, selected_term)
@@ -1388,7 +1325,11 @@ if uploaded:
     except Exception as exc:
         st.sidebar.error(f"Excel error: {exc}")
 
-# Try to load saved results from Supabase first (for all roles)
+
+# ============================================================
+# AUTO-LOAD SAVED RESULTS FROM SUPABASE
+# ============================================================
+
 if st.session_state.data is None:
     persisted = load_results_store()
     if persisted is not None and not persisted.empty:
@@ -1401,7 +1342,11 @@ if st.session_state.data is None:
         except Exception:
             pass
 
-# If still no data and user is admin/teacher, show welcome + upload prompt
+
+# ============================================================
+# WELCOME SCREEN FOR ADMIN/TEACHER WITH NO DATA
+# ============================================================
+
 if st.session_state.data is None and st.session_state.user_role not in ["student", "parent"]:
     st.markdown(
         '<div class="app-title">Welcome to the Academic Management System</div>',
@@ -1411,23 +1356,25 @@ if st.session_state.data is None and st.session_state.user_role not in ["student
         '<div class="app-subtitle">Upload your student_results.xlsx file from the left menu to begin.</div>',
         unsafe_allow_html=True
     )
-
     st.info(
         "Expected columns include Name, Stream/Class, term averages such as "
         "y1t1avg through y2t3avg, and subject columns such as y2t3maths."
     )
-
     a, b, c = st.columns(3)
     a.metric("Dashboard", "School overview")
     b.metric("Student Reports", "Individual analysis")
     c.metric("PDF Reports", "Ready to download")
-
     st.markdown("### First-time setup")
     st.write("1. Upload the Excel file.")
     st.write("2. Choose the analysis term.")
     st.write("3. Click **Load / Analyse Results**.")
     st.write("4. Use the navigation menu to explore the system.")
     st.stop()
+
+
+# ============================================================
+# DATA ASSIGNMENT
+# ============================================================
 
 if st.session_state.data is None and st.session_state.user_role in ["student", "parent"]:
     data = None
@@ -1440,14 +1387,24 @@ else:
     name_col = data["name_col"]
     stream_col = data["stream_col"]
 
+
+# ============================================================
+# HEADER
+# ============================================================
+
 st.markdown(
     f'<div class="app-title">{st.session_state.school_name}</div>',
     unsafe_allow_html=True
 )
 st.markdown(
-    f'<div class="app-subtitle">Academic Management System • V19 • {data["analysis_term"].upper() if data is not None else "Learning Centre"}</div>',
+    f'<div class="app-subtitle">Academic Management System • V20 • {data["analysis_term"].upper() if data is not None else "Learning Centre"}</div>',
     unsafe_allow_html=True
 )
+
+
+# ============================================================
+# NAVIGATION
+# ============================================================
 
 if st.session_state.user_role == "student":
     nav_items = ["My Dashboard", "Learning Centre", "Online Tests & Quizzes", "My Profile", "Change Password"]
@@ -1705,7 +1662,7 @@ if page == "My Dashboard":
 
 
 # ============================================================
-# DASHBOARD
+# DASHBOARD (admin/teacher)
 # ============================================================
 
 if page == "Dashboard":
@@ -1719,7 +1676,6 @@ if page == "Dashboard":
     c5.metric("Pass Rate", f"{stats['pass_rate']:.1f}%")
 
     st.divider()
-
     left, right = st.columns(2)
 
     with left:
@@ -1742,13 +1698,8 @@ if page == "Dashboard":
 
     st.subheader("Top 10 students")
     top = df.sort_values("overall_rank").head(10)
-    top_view = top[
-        [name_col, stream_col, "overall_rank", "stream_rank", target, "term_change"]
-    ].copy()
-    top_view.columns = [
-        "Student", "Stream", "School Rank",
-        "Stream Rank", "Final Average", "Change"
-    ]
+    top_view = top[[name_col, stream_col, "overall_rank", "stream_rank", target, "term_change"]].copy()
+    top_view.columns = ["Student", "Stream", "School Rank", "Stream Rank", "Final Average", "Change"]
     top_view["Grade"] = top_view["Final Average"].apply(grade)
     st.dataframe(top_view.round(1), use_container_width=True, hide_index=True)
 
@@ -1898,7 +1849,11 @@ elif page == "Students":
     st.session_state.report_issue_date = report_date
 
     st.markdown("### 📄 Student report")
-    pdf = generate_student_pdf(student, data, st.session_state.school_name, st.session_state.get("teacher_comments", {}).get(student_key, teacher_comment), report_date=report_date)
+    pdf = generate_student_pdf(
+        student, data, st.session_state.school_name,
+        st.session_state.get("teacher_comments", {}).get(student_key, teacher_comment),
+        report_date=report_date
+    )
     safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", selected).strip("_")
     st.download_button(
         "⬇️ Download Individual PDF Report",
@@ -1964,7 +1919,10 @@ elif page == "Student Records":
             except Exception:
                 val = 0.0
             val = max(0.0, min(100.0, val))
-            avg_inputs[col] = avg_grid[i % 3].number_input(str(col).upper(), min_value=0.0, max_value=100.0, value=val, step=0.1, key=f"record_avg_{edit_idx}_{col}")
+            avg_inputs[col] = avg_grid[i % 3].number_input(
+                str(col).upper(), min_value=0.0, max_value=100.0,
+                value=val, step=0.1, key=f"record_avg_{edit_idx}_{col}"
+            )
 
         if st.button("💾 Save Student Changes", type="primary", use_container_width=True, key="save_student_changes"):
             working.loc[edit_idx, raw_name_col] = new_name.strip() or str(current[raw_name_col])
@@ -1992,7 +1950,10 @@ elif page == "Student Records":
         add_values = {}
         add_grid = st.columns(3)
         for i, col in enumerate(avg_cols_unique):
-            add_values[col] = add_grid[i % 3].number_input(str(col).upper(), min_value=0.0, max_value=100.0, value=0.0, step=0.1, key=f"add_avg_{col}")
+            add_values[col] = add_grid[i % 3].number_input(
+                str(col).upper(), min_value=0.0, max_value=100.0,
+                value=0.0, step=0.1, key=f"add_avg_{col}"
+            )
         if st.button("➕ Add Student", type="primary", use_container_width=True, key="add_student_button"):
             if not add_name.strip():
                 st.error("Enter the student's name first.")
@@ -2034,8 +1995,14 @@ elif page == "Student Records":
             working.to_excel(writer, index=False, sheet_name="Student Results")
         excel_buffer.seek(0)
         export_name = f"Updated_Student_Records_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-        st.download_button("⬇️ Download Updated Excel Records", data=excel_buffer.getvalue(), file_name=export_name, mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", type="primary", use_container_width=True)
-
+        st.download_button(
+            "⬇️ Download Updated Excel Records",
+            data=excel_buffer.getvalue(),
+            file_name=export_name,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary",
+            use_container_width=True
+        )
         st.markdown("### Current records")
         st.dataframe(working, use_container_width=True, hide_index=True)
 
@@ -2062,7 +2029,7 @@ elif page == "Academic Results":
     term_choice = st.selectbox(
         "📅 Select term to edit",
         raw_terms,
-        index=raw_terms.index(data["analysis_term"]) if data["analysis_term"] in raw_terms else len(raw_terms)-1,
+        index=raw_terms.index(data["analysis_term"]) if data["analysis_term"] in raw_terms else len(raw_terms) - 1,
         format_func=lambda x: x.upper(),
     )
 
@@ -2072,6 +2039,7 @@ elif page == "Academic Results":
         if term_choice in str(c).lower()
         and c != avg_col
         and "avg" not in str(c).lower()
+        and "total" not in str(c).lower()
         and c not in [raw_name_col, raw_stream_col]
     ]
     term_subjects = [
@@ -2307,7 +2275,6 @@ elif page == "Reports":
         use_container_width=True
     )
 
-
 # ============================================================
 # LEARNING CENTRE
 # ============================================================
@@ -2349,45 +2316,46 @@ elif page == "Learning Centre":
                     pass
 
         st.markdown("### 📊 Learning Centre Dashboard")
-        a,b,c,d=st.columns(4)
+        a, b, c, d = st.columns(4)
         a.metric("Assignments", len(assignments))
         b.metric("Submissions", len(all_submissions))
         c.metric("Awaiting Review", pending)
         d.metric("Overdue", overdue)
 
         tab1, tab2, tab3 = st.tabs(["📤 Post Material", "📋 Posted Materials", "📥 Student Submissions"])
+
         with tab1:
             st.markdown("### Create a new learning resource")
-            c1,c2=st.columns(2)
+            c1, c2 = st.columns(2)
             with c1:
-                title=st.text_input("Title", placeholder="e.g. Algebra Assignment 1")
-                mtype=st.selectbox("Material type", ["Assignment","Notes","Revision Material","Announcement","Past Paper","Other"])
-                subject=st.text_input("Subject", placeholder="e.g. Mathematics")
+                title = st.text_input("Title", placeholder="e.g. Algebra Assignment 1")
+                mtype = st.selectbox("Material type", ["Assignment", "Notes", "Revision Material", "Announcement", "Past Paper", "Other"])
+                subject = st.text_input("Subject", placeholder="e.g. Mathematics")
             with c2:
-                streams=["All Streams"]
+                streams = ["All Streams"]
                 if st.session_state.get("data") is not None:
                     streams += sorted([str(x) for x in st.session_state.data["df"][st.session_state.data["stream_col"]].dropna().unique()])
-                target_stream=st.selectbox("Target stream / class", streams)
-                deadline=st.date_input("Deadline (optional)", value=None)
-                external_link=st.text_input("Video / external resource link (optional)", placeholder="https://...")
-            description=st.text_area("Instructions / description", height=100)
-            file=st.file_uploader("Attach notes or assignment file (optional)", type=None, key="learning_upload")
+                target_stream = st.selectbox("Target stream / class", streams)
+                deadline = st.date_input("Deadline (optional)", value=None)
+                external_link = st.text_input("Video / external resource link (optional)", placeholder="https://...")
+            description = st.text_area("Instructions / description", height=100)
+            file = st.file_uploader("Attach notes or assignment file (optional)", type=None, key="learning_upload")
             if st.button("📤 Publish to Learning Centre", type="primary", use_container_width=True):
                 if not title.strip():
                     st.error("Please enter a title.")
                 elif not file and not external_link.strip() and not description.strip():
                     st.error("Add a file, link, or instructions before publishing.")
                 else:
-                    saved_name=""; saved_path=""
+                    saved_name = ""
+                    saved_path = ""
                     if file is not None:
-                        import base64
-                        safe=re.sub(r"[^A-Za-z0-9._-]+", "_", file.name)
-                        saved_name=safe
+                        safe = re.sub(r"[^A-Za-z0-9._-]+", "_", file.name)
+                        saved_name = safe
                         file_b64 = base64.b64encode(file.getbuffer()).decode('utf-8')
                         saved_path = "BASE64::" + file_b64
-                    add_material(title.strip(),mtype,subject.strip(),target_stream,description.strip(),
-                                 str(deadline) if deadline else "",saved_name,saved_path,
-                                 external_link.strip(),st.session_state.username)
+                    add_material(title.strip(), mtype, subject.strip(), target_stream,
+                                 description.strip(), str(deadline) if deadline else "",
+                                 saved_name, saved_path, external_link.strip(), st.session_state.username)
                     st.success("Material published to cloud.")
                     st.rerun()
 
@@ -2398,11 +2366,12 @@ elif page == "Learning Centre":
                 with st.container(border=True):
                     st.markdown(f"### {m['title']}")
                     st.write(f"**Type:** {m['material_type']}  •  **Subject:** {m['subject'] or 'General'}  •  **Target:** {m['target_stream']}")
-                    if m['deadline']: st.write(f"**Deadline:** {m['deadline']}")
-                    if m['description']: st.write(m['description'])
-                    cols=st.columns([1,1,1,1])
+                    if m['deadline']:
+                        st.write(f"**Deadline:** {m['deadline']}")
+                    if m['description']:
+                        st.write(m['description'])
+                    cols = st.columns([1, 1, 1, 1])
                     if m['file_path'] and str(m['file_path']).startswith("BASE64::"):
-                        import base64
                         try:
                             raw = base64.b64decode(m['file_path'][8:])
                             cols[0].download_button("⬇️ Download file", raw, file_name=m['file_name'], key=f"dlm{m['id']}")
@@ -2411,24 +2380,29 @@ elif page == "Learning Centre":
                     if m['external_link']:
                         cols[1].markdown(f"[🔗 Open link]({m['external_link']})")
                     if cols[3].button("🗑️ Delete", key=f"delm{m['id']}"):
-                        delete_material(m['id']); st.rerun()
+                        delete_material(m['id'])
+                        st.rerun()
                     st.caption(f"Posted by {m['uploaded_by']} on {m['created_at']}")
 
         with tab3:
-            subs=get_submissions()
+            subs = get_submissions()
             if not subs:
                 st.info("No student submissions yet.")
             else:
-                sub_df=pd.DataFrame(subs)
-                st.dataframe(sub_df[["title","student_name","subject","file_name","submitted_at","status","teacher_feedback"]], use_container_width=True, hide_index=True)
+                sub_df = pd.DataFrame(subs)
+                st.dataframe(
+                    sub_df[["title", "student_name", "subject", "file_name", "submitted_at", "status", "teacher_feedback"]],
+                    use_container_width=True, hide_index=True
+                )
                 st.markdown("### Give feedback")
-                sub_options={f"{s['student_name']} — {s['title']} — {s['submitted_at']}":s for s in subs}
-                selected_label=st.selectbox("Submission", list(sub_options))
-                selected=sub_options[selected_label]
-                feedback=st.text_area("Teacher feedback", value=selected.get("teacher_feedback", ""), key=f"feedback_{selected['id']}")
+                sub_options = {f"{s['student_name']} — {s['title']} — {s['submitted_at']}": s for s in subs}
+                selected_label = st.selectbox("Submission", list(sub_options))
+                selected = sub_options[selected_label]
+                feedback = st.text_area("Teacher feedback", value=selected.get("teacher_feedback", ""), key=f"feedback_{selected['id']}")
                 if st.button("Save Feedback", type="primary"):
                     update_quiz_feedback(selected['id'], feedback, 'Reviewed')
-                    st.success("Feedback saved."); st.rerun()
+                    st.success("Feedback saved.")
+                    st.rerun()
 
     else:
         st.markdown("### 🎓 Student Learning Dashboard")
@@ -2439,43 +2413,52 @@ elif page == "Learning Centre":
                 student_name = (sp.get("student_full_name") or "").strip()
         if not student_name:
             st.warning("Enter the student name used in the academic Excel file.")
-            student_name=st.text_input("Student name")
+            student_name = st.text_input("Student name")
 
         student_submissions = get_submissions(student_name=student_name) if student_name else []
         student_materials = []
-        streams=[]
+        streams = []
         if st.session_state.get("data") is not None and student_name:
-            d=st.session_state.data["df"]; nc=st.session_state.data["name_col"]; sc=st.session_state.data["stream_col"]
-            matches=d[d[nc].astype(str).str.lower()==student_name.lower()]
-            if not matches.empty: streams=matches[sc].astype(str).tolist()
+            d = st.session_state.data["df"]
+            nc = st.session_state.data["name_col"]
+            sc = st.session_state.data["stream_col"]
+            matches = d[d[nc].astype(str).str.lower() == student_name.lower()]
+            if not matches.empty:
+                streams = matches[sc].astype(str).tolist()
         for m in materials:
-            if m["target_stream"]=="All Streams" or not streams or m["target_stream"] in streams:
+            if m["target_stream"] == "All Streams" or not streams or m["target_stream"] in streams:
                 student_materials.append(m)
 
-        assignments=[m for m in student_materials if m.get("material_type")=="Assignment"]
-        submitted_ids={s.get("material_id") for s in student_submissions}
-        pending_count=sum(1 for m in assignments if m.get("id") not in submitted_ids)
-        reviewed_count=sum(1 for s in student_submissions if s.get("status")=="Reviewed")
+        assignments = [m for m in student_materials if m.get("material_type") == "Assignment"]
+        submitted_ids = {s.get("material_id") for s in student_submissions}
+        pending_count = sum(1 for m in assignments if m.get("id") not in submitted_ids)
+        reviewed_count = sum(1 for s in student_submissions if s.get("status") == "Reviewed")
 
-        a,b,c=st.columns(3)
+        a, b, c = st.columns(3)
         a.metric("Available Materials", len(student_materials))
         b.metric("Pending Assignments", pending_count)
         c.metric("Feedback Received", reviewed_count)
 
-        announcements=[m for m in student_materials if m.get("material_type")=="Announcement"]
+        announcements = [m for m in student_materials if m.get("material_type") == "Announcement"]
         if announcements:
             st.markdown("### 📢 Announcements")
-            for m in sorted(announcements, key=lambda x:x.get("created_at", ""), reverse=True)[:5]:
+            for m in sorted(announcements, key=lambda x: x.get("created_at", ""), reverse=True)[:5]:
                 with st.container(border=True):
                     st.markdown(f"**{m['title']}**")
-                    if m.get("description"): st.write(m["description"])
+                    if m.get("description"):
+                        st.write(m["description"])
                     st.caption(f"Posted {m.get('created_at','')}")
 
         st.markdown("### 📝 Assignment Status")
         if assignments:
-            rows=[]
+            rows = []
             for m in assignments:
-                rows.append({"Assignment":m["title"],"Subject":m.get("subject") or "General","Deadline":m.get("deadline") or "No deadline","Status":lc_status(m,student_name)})
+                rows.append({
+                    "Assignment": m["title"],
+                    "Subject": m.get("subject") or "General",
+                    "Deadline": m.get("deadline") or "No deadline",
+                    "Status": lc_status(m, student_name)
+                })
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
         else:
             st.info("No assignments available.")
@@ -2487,29 +2470,33 @@ elif page == "Learning Centre":
             with st.container(border=True):
                 st.markdown(f"### {m['title']}")
                 st.write(f"**{m['material_type']}** • {m['subject'] or 'General'}")
-                if m['deadline']: st.write(f"**Deadline:** {m['deadline']}")
-                if m['description']: st.write(m['description'])
-                cols=st.columns(3)
+                if m['deadline']:
+                    st.write(f"**Deadline:** {m['deadline']}")
+                if m['description']:
+                    st.write(m['description'])
+                cols = st.columns(3)
                 if m['file_path'] and str(m['file_path']).startswith("BASE64::"):
-                    import base64
                     try:
                         raw = base64.b64decode(m['file_path'][8:])
                         cols[0].download_button("⬇️ Download", raw, file_name=m['file_name'], key=f"stdl{m['id']}")
                     except Exception:
                         pass
-                if m['external_link']: cols[1].markdown(f"[🔗 Open resource]({m['external_link']})")
-                previous=get_submissions(material_id=m['id'], student_name=student_name)
+                if m['external_link']:
+                    cols[1].markdown(f"[🔗 Open resource]({m['external_link']})")
+                previous = get_submissions(material_id=m['id'], student_name=student_name)
                 if previous:
                     st.success(f"Submitted on {previous[0]['submitted_at']} • {previous[0]['status']}")
-                    if previous[0]['teacher_feedback']: st.info(f"Teacher feedback: {previous[0]['teacher_feedback']}")
-                upload=st.file_uploader("Submit your work", type=None, key=f"submission_{m['id']}")
+                    if previous[0]['teacher_feedback']:
+                        st.info(f"Teacher feedback: {previous[0]['teacher_feedback']}")
+                upload = st.file_uploader("Submit your work", type=None, key=f"submission_{m['id']}")
                 if st.button("📤 Submit Work", key=f"submit_{m['id']}", type="primary"):
-                    if upload is None: st.error("Choose your file first.")
+                    if upload is None:
+                        st.error("Choose your file first.")
                     else:
-                        import base64
                         file_b64 = "BASE64::" + base64.b64encode(upload.getbuffer()).decode('utf-8')
                         save_submission(m['id'], student_name.strip(), upload, file_b64)
-                        st.success("Work submitted."); st.rerun()
+                        st.success("Work submitted.")
+                        st.rerun()
 
 
 # ============================================================
@@ -2524,60 +2511,62 @@ elif page == "Online Tests & Quizzes":
     quizzes = get_quizzes()
 
     def student_streams_for(name):
-        streams=[]
+        streams = []
         if st.session_state.get("data") is not None and name:
-            d=st.session_state.data["df"]; nc=st.session_state.data["name_col"]; sc=st.session_state.data["stream_col"]
-            matches=d[d[nc].astype(str).str.lower()==name.lower()]
+            d = st.session_state.data["df"]
+            nc = st.session_state.data["name_col"]
+            sc = st.session_state.data["stream_col"]
+            matches = d[d[nc].astype(str).str.lower() == name.lower()]
             if not matches.empty:
-                streams=matches[sc].astype(str).tolist()
+                streams = matches[sc].astype(str).tolist()
         return streams
 
     if role in ("admin", "teacher"):
-        attempts=get_attempts()
+        attempts = get_attempts()
         st.markdown("### 📊 Quiz Dashboard")
-        q1,q2,q3,q4=st.columns(4)
+        q1, q2, q3, q4 = st.columns(4)
         q1.metric("Quizzes", len(quizzes))
         q2.metric("Attempts", len(attempts))
-        q3.metric("Reviewed", sum(1 for a in attempts if a.get("status")=="Reviewed"))
-        q4.metric("Awaiting Review", sum(1 for a in attempts if a.get("status")!="Reviewed"))
+        q3.metric("Reviewed", sum(1 for a in attempts if a.get("status") == "Reviewed"))
+        q4.metric("Awaiting Review", sum(1 for a in attempts if a.get("status") != "Reviewed"))
 
         create_tab, manage_tab, results_tab = st.tabs(["➕ Create Quiz", "📋 Manage Quizzes", "📊 Student Results"])
 
         with create_tab:
-            c1,c2=st.columns(2)
+            c1, c2 = st.columns(2)
             with c1:
-                qtitle=st.text_input("Quiz title", placeholder="e.g. Mathematics Test 1")
-                qsubject=st.text_input("Subject", placeholder="e.g. Mathematics")
-                qdesc=st.text_area("Instructions / description", height=90)
+                qtitle = st.text_input("Quiz title", placeholder="e.g. Mathematics Test 1")
+                qsubject = st.text_input("Subject", placeholder="e.g. Mathematics")
+                qdesc = st.text_area("Instructions / description", height=90)
             with c2:
-                streams=["All Streams"]
+                streams = ["All Streams"]
                 if st.session_state.get("data") is not None:
                     streams += sorted([str(x) for x in st.session_state.data["df"][st.session_state.data["stream_col"]].dropna().unique()])
-                qstream=st.selectbox("Target stream / class", streams, key="quiz_stream")
-                qdeadline=st.date_input("Closing date (optional)", value=None, key="quiz_deadline")
-                qduration=st.number_input("Time limit (minutes)", min_value=1, max_value=300, value=30, step=5)
-            n_questions=st.number_input("Number of questions", min_value=1, max_value=30, value=5, step=1)
-            questions=[]
-            for i in range(1,int(n_questions)+1):
+                qstream = st.selectbox("Target stream / class", streams, key="quiz_stream")
+                qdeadline = st.date_input("Closing date (optional)", value=None, key="quiz_deadline")
+                qduration = st.number_input("Time limit (minutes)", min_value=1, max_value=300, value=30, step=5)
+            n_questions = st.number_input("Number of questions", min_value=1, max_value=30, value=5, step=1)
+            questions = []
+            for i in range(1, int(n_questions) + 1):
                 with st.container(border=True):
                     st.markdown(f"**Question {i}**")
-                    text_q=st.text_area("Question", key=f"vq_text_{i}", height=70)
-                    typ=st.selectbox("Question type", ["Multiple Choice","True / False","Short Answer"], key=f"vq_type_{i}")
-                    pts=st.number_input("Marks", min_value=0.5, max_value=100.0, value=1.0, step=0.5, key=f"vq_pts_{i}")
-                    q={"text":text_q.strip(),"type":typ,"points":pts}
-                    if typ=="Multiple Choice":
-                        a,b=st.columns(2)
-                        with a:
-                            q["a"]=st.text_input("Option A", key=f"vq_a_{i}")
-                            q["c"]=st.text_input("Option C", key=f"vq_c_{i}")
-                        with b:
-                            q["b"]=st.text_input("Option B", key=f"vq_b_{i}")
-                            q["d"]=st.text_input("Option D", key=f"vq_d_{i}")
-                        q["correct"]=st.selectbox("Correct answer", ["A","B","C","D"], key=f"vq_correct_{i}")
-                    elif typ=="True / False":
-                        q["correct"]=st.selectbox("Correct answer", ["True","False"], key=f"vq_tf_{i}")
+                    text_q = st.text_area("Question", key=f"vq_text_{i}", height=70)
+                    typ = st.selectbox("Question type", ["Multiple Choice", "True / False", "Short Answer"], key=f"vq_type_{i}")
+                    pts = st.number_input("Marks", min_value=0.5, max_value=100.0, value=1.0, step=0.5, key=f"vq_pts_{i}")
+                    q = {"text": text_q.strip(), "type": typ, "points": pts}
+                    if typ == "Multiple Choice":
+                        aa, bb = st.columns(2)
+                        with aa:
+                            q["a"] = st.text_input("Option A", key=f"vq_a_{i}")
+                            q["c"] = st.text_input("Option C", key=f"vq_c_{i}")
+                        with bb:
+                            q["b"] = st.text_input("Option B", key=f"vq_b_{i}")
+                            q["d"] = st.text_input("Option D", key=f"vq_d_{i}")
+                        q["correct"] = st.selectbox("Correct answer", ["A", "B", "C", "D"], key=f"vq_correct_{i}")
+                    elif typ == "True / False":
+                        q["correct"] = st.selectbox("Correct answer", ["True", "False"], key=f"vq_tf_{i}")
                     else:
-                        q["correct"]=""
+                        q["correct"] = ""
                     questions.append(q)
             if st.button("🚀 Publish Quiz", type="primary", use_container_width=True):
                 if not qtitle.strip():
@@ -2585,9 +2574,9 @@ elif page == "Online Tests & Quizzes":
                 elif any(not q["text"] for q in questions):
                     st.error("Every question must have text.")
                 else:
-                    add_quiz(qtitle.strip(),qsubject.strip(),qstream,qdesc.strip(),
-                             str(qdeadline) if qdeadline else "",qduration,
-                             st.session_state.username,questions)
+                    add_quiz(qtitle.strip(), qsubject.strip(), qstream, qdesc.strip(),
+                             str(qdeadline) if qdeadline else "", qduration,
+                             st.session_state.username, questions)
                     st.success("Quiz published to cloud.")
                     st.rerun()
 
@@ -2598,99 +2587,196 @@ elif page == "Online Tests & Quizzes":
                 with st.container(border=True):
                     st.markdown(f"### {qz['title']}")
                     st.write(f"**Subject:** {qz['subject'] or 'General'} • **Target:** {qz['target_stream']} • **Time:** {qz['duration_minutes']} minutes")
-                    if qz['deadline']: st.write(f"**Closing date:** {qz['deadline']}")
-                    qs=get_quiz_questions(qz['id'])
+                    if qz['deadline']:
+                        st.write(f"**Closing date:** {qz['deadline']}")
+                    qs = get_quiz_questions(qz['id'])
                     st.caption(f"{len(qs)} questions")
                     if st.button("🗑️ Delete", key=f"qdel{qz['id']}"):
-                        delete_quiz(qz['id']); st.rerun()
+                        delete_quiz(qz['id'])
+                        st.rerun()
 
         with results_tab:
             if not attempts:
                 st.info("No attempts yet.")
             else:
-                result_rows=[]
+                result_rows = []
                 for a in attempts:
-                    pct,_=quiz_grade(a['score'],a['total_points'])
-                    result_rows.append({"Quiz":a['title'],"Student":a['student_name'],"Score":f"{a['score']:.1f}/{a['total_points']:.1f}","Percentage":f"{pct:.1f}%","Status":a['status'],"Submitted":a['submitted_at']})
+                    pct, _ = quiz_grade(a['score'], a['total_points'])
+                    result_rows.append({
+                        "Quiz": a['title'],
+                        "Student": a['student_name'],
+                        "Score": f"{a['score']:.1f}/{a['total_points']:.1f}",
+                        "Percentage": f"{pct:.1f}%",
+                        "Status": a['status'],
+                        "Submitted": a['submitted_at']
+                    })
                 st.dataframe(pd.DataFrame(result_rows), use_container_width=True, hide_index=True)
+
                 st.markdown("### Review attempt")
-                options={f"{a['student_name']} — {a['title']} — {a['submitted_at']}":a for a in attempts}
-                selected_label=st.selectbox("Attempt", list(options))
-                selected=options[selected_label]
-                pct,g=quiz_grade(selected['score'],selected['total_points'])
-                x,y,z=st.columns(3); x.metric("Score",f"{selected['score']:.1f}/{selected['total_points']:.1f}"); y.metric("Percentage",f"{pct:.1f}%"); z.metric("Grade",g)
-                feedback=st.text_area("Teacher feedback", value=selected.get('teacher_feedback',''), key=f"qfeedback{selected['id']}")
-                if st.button("Save Quiz Feedback", type="primary"):
-                    update_quiz_feedback(selected['id'],feedback); st.success("Feedback saved."); st.rerun()
+                options = {f"{a['student_name']} — {a['title']} — {a['submitted_at']}": a for a in attempts}
+                selected_label = st.selectbox("Attempt", list(options))
+                selected = options[selected_label]
+                pct, g = quiz_grade(selected['score'], selected['total_points'])
+                x, y, z = st.columns(3)
+                x.metric("Score", f"{selected['score']:.1f}/{selected['total_points']:.1f}")
+                y.metric("Percentage", f"{pct:.1f}%")
+                z.metric("Grade", g)
+
+                feedback = st.text_area("Teacher feedback", value=selected.get('teacher_feedback', ''), key=f"qfeedback{selected['id']}")
+
+                st.markdown("### 📝 Student Answers")
+                answers = json.loads(selected.get('answers_json') or '{}')
+                manual_marks = json.loads(selected.get('manual_marks_json') or '{}')
+
+                for qq in get_quiz_questions(selected['quiz_id']):
+                    ans = answers.get(str(qq['id']), "")
+                    st.markdown(f"**Q{qq['question_no']}: {qq['question_text']}**")
+
+                    if qq['question_type'] == "Multiple Choice":
+                        opts = {"A": qq.get('option_a', ''), "B": qq.get('option_b', ''),
+                                "C": qq.get('option_c', ''), "D": qq.get('option_d', '')}
+                        correct = qq.get('correct_answer', '')
+                        if ans == correct:
+                            st.success(f"Student answered: **{ans}** — {opts.get(ans, '')} ✅ Correct")
+                        else:
+                            st.error(f"Student answered: **{ans or '(no answer)'}** — {opts.get(ans, '(blank)') if ans else '(no answer)'}")
+                            st.caption(f"Correct answer: **{correct}** — {opts.get(correct, '')}")
+
+                    elif qq['question_type'] == "True / False":
+                        correct = qq.get('correct_answer', '')
+                        if ans == correct:
+                            st.success(f"Student answered: **{ans}** ✅ Correct")
+                        else:
+                            st.error(f"Student answered: **{ans or '(no answer)'}**")
+                            st.caption(f"Correct answer: **{correct}**")
+
+                    else:                                        
+                        st.info(f"Student's written answer: **{ans or '(no answer)'}**")
+                        max_pts = float(qq.get('points', 1))
+                        existing_mark = float(manual_marks.get(str(qq['id']), 0.0))
+                        awarded = st.number_input(
+                            f"Award marks (out of {max_pts:g})",
+                            min_value=0.0,
+                            max_value=max_pts,
+                            value=existing_mark,
+                            step=0.5,
+                            key=f"marks_input_{selected['id']}_{qq['id']}"
+                        )
+                        if st.button("💾 Save This Mark", key=f"save_mark_{selected['id']}_{qq['id']}"):
+                            manual_marks[str(qq['id'])] = float(awarded)
+                            save_manual_marks(selected['id'], manual_marks)
+                            st.success(f"Mark saved for Q{qq['question_no']}.")
+                            st.rerun()
+
+                    st.markdown("---")
+
+                if st.button("✅ Finalize Quiz Score", type="primary", use_container_width=True):
+                    auto_score = float(selected.get('score') or 0)
+                    fresh_manual = json.loads(selected.get('manual_marks_json') or '{}')
+                    new_score = finalize_quiz_attempt(
+                        selected['id'], auto_score, fresh_manual, selected['total_points']
+                    )
+                    st.success(f"Final score: {new_score:.1f}/{selected['total_points']:.1f}. Status set to Reviewed.")
+                    st.rerun()
+
+                if st.button("💾 Save Quiz Feedback", type="primary", key=f"save_feedback_{selected['id']}"):
+                    update_quiz_feedback(selected['id'], feedback)
+                    st.success("Feedback saved.")
+                    st.rerun()
 
     else:
-        student_name=st.session_state.student_name.strip()
+        student_name = st.session_state.student_name.strip()
         if not student_name:
             sp = get_student_profile(st.session_state.username)
             if sp:
                 student_name = (sp.get("student_full_name") or "").strip()
         if not student_name:
             st.warning("Enter the student name used in the academic Excel file.")
-            student_name=st.text_input("Student name", key="quiz_student_name")
-        streams=student_streams_for(student_name)
-        available=[q for q in quizzes if quiz_available_for_student(q,streams)]
-        attempts=get_attempts(student_name=student_name) if student_name else []
-        attempted_ids={a['quiz_id'] for a in attempts}
-        pending=[q for q in available if q['id'] not in attempted_ids]
+            student_name = st.text_input("Student name", key="quiz_student_name")
+
+        streams = student_streams_for(student_name)
+        available = [q for q in quizzes if quiz_available_for_student(q, streams)]
+        attempts = get_attempts(student_name=student_name) if student_name else []
+        attempted_ids = {a['quiz_id'] for a in attempts}
+        pending = [q for q in available if q['id'] not in attempted_ids]
+
         st.markdown("### 🎓 Student Quiz Dashboard")
-        a,b,c=st.columns(3); a.metric("Available",len(available)); b.metric("Pending",len(pending)); c.metric("Completed",len(attempts))
-        take_tab, result_tab=st.tabs(["📝 Available Quizzes","🏆 My Results"])
+        a, b, c = st.columns(3)
+        a.metric("Available", len(available))
+        b.metric("Pending", len(pending))
+        c.metric("Completed", len(attempts))
+
+        take_tab, result_tab = st.tabs(["📝 Available Quizzes", "🏆 My Results"])
+
         with take_tab:
-            if not pending: st.info("No new quizzes available.")
+            if not pending:
+                st.info("No new quizzes available.")
             for qz in pending:
                 with st.container(border=True):
                     st.markdown(f"### {qz['title']}")
                     st.write(f"**Subject:** {qz['subject'] or 'General'} • **Questions:** {len(get_quiz_questions(qz['id']))} • **Time:** {qz['duration_minutes']} minutes")
-                    if qz['deadline']: st.write(f"**Closing date:** {qz['deadline']}")
-                    if qz['description']: st.write(qz['description'])
+                    if qz['deadline']:
+                        st.write(f"**Closing date:** {qz['deadline']}")
+                    if qz['description']:
+                        st.write(qz['description'])
                     if st.button("▶️ Start Quiz", key=f"startquiz{qz['id']}", type="primary"):
-                        st.session_state.active_quiz=qz['id']; st.rerun()
-            active=st.session_state.get('active_quiz')
+                        st.session_state.active_quiz = qz['id']
+                        st.rerun()
+
+            active = st.session_state.get('active_quiz')
             if active:
-                qz=next((q for q in available if q['id']==active),None)
+                qz = next((q for q in available if q['id'] == active), None)
                 if qz:
-                    st.divider(); st.markdown(f"## 📝 {qz['title']}")
-                    answers={}; total=0; auto_score=0; has_manual=False
+                    st.divider()
+                    st.markdown(f"## 📝 {qz['title']}")
+                    answers = {}
+                    total = 0
+                    auto_score = 0
+                    has_manual = False
                     for qq in get_quiz_questions(qz['id']):
-                        pts=float(qq['points']); total += pts
+                        pts = float(qq['points'])
+                        total += pts
                         st.markdown(f"**{qq['question_no']}. {qq['question_text']}**  _({pts:g} marks)_")
-                        if qq['question_type']=="Multiple Choice":
-                            ans=st.radio("Answer",[f"A. {qq['option_a']}",f"B. {qq['option_b']}",f"C. {qq['option_c']}",f"D. {qq['option_d']}"],key=f"ans{qq['id']}")
-                            letter=ans.split('.',1)[0] if ans else ""
-                            answers[str(qq['id'])]=letter
-                            if letter==qq['correct_answer']: auto_score += pts
-                        elif qq['question_type']=="True / False":
-                            ans=st.radio("Answer",["True","False"],key=f"ans{qq['id']}")
-                            answers[str(qq['id'])]=ans
-                            if ans==qq['correct_answer']: auto_score += pts
+                        if qq['question_type'] == "Multiple Choice":
+                            ans = st.radio("Answer", [
+                                f"A. {qq['option_a']}", f"B. {qq['option_b']}",
+                                f"C. {qq['option_c']}", f"D. {qq['option_d']}"
+                            ], key=f"ans{qq['id']}")
+                            letter = ans.split('.', 1)[0] if ans else ""
+                            answers[str(qq['id'])] = letter
+                            if letter == qq['correct_answer']:
+                                auto_score += pts
+                        elif qq['question_type'] == "True / False":
+                            ans = st.radio("Answer", ["True", "False"], key=f"ans{qq['id']}")
+                            answers[str(qq['id'])] = ans
+                            if ans == qq['correct_answer']:
+                                auto_score += pts
                         else:
-                            ans=st.text_area("Your answer",key=f"ans{qq['id']}",height=80)
-                            answers[str(qq['id'])]=ans
-                            has_manual=True
+                            ans = st.text_area("Your answer", key=f"ans{qq['id']}", height=80)
+                            answers[str(qq['id'])] = ans
+                            has_manual = True
                     if st.button("📤 Submit Quiz", type="primary", use_container_width=True):
-                        status="Needs Teacher Review" if has_manual else "Submitted"
-                        save_quiz_attempt(qz['id'],student_name.strip(),answers,auto_score,total,status)
-                        st.session_state.active_quiz=None
+                        status = "Needs Teacher Review" if has_manual else "Submitted"
+                        save_quiz_attempt(qz['id'], student_name.strip(), answers, auto_score, total, status)
+                        st.session_state.active_quiz = None
                         st.success(f"Submitted. Score: {auto_score:.1f}/{total:.1f}")
                         st.rerun()
+
         with result_tab:
-            if not attempts: st.info("No attempts yet.")
+            if not attempts:
+                st.info("No attempts yet.")
             for a in attempts:
-                pct,g=quiz_grade(a['score'],a['total_points'])
+                pct, g = quiz_grade(a['score'], a['total_points'])
                 with st.container(border=True):
                     st.markdown(f"### {a['title']}")
                     st.write(f"**Score:** {a['score']:.1f}/{a['total_points']:.1f} • **Percentage:** {pct:.1f}% • **Grade:** {g}")
                     st.write(f"**Status:** {a['status']} • Submitted: {a['submitted_at']}")
-                    if a.get('teacher_feedback'): st.info(f"Teacher feedback: {a['teacher_feedback']}")
+                    if a.get('teacher_feedback'):
+                        st.info(f"Teacher feedback: {a['teacher_feedback']}")
 
 
 # ============================================================
-# MY PROFILE
+# CHANGE PASSWORD
 # ============================================================
 
 elif page == "Change Password":
@@ -2715,6 +2801,11 @@ elif page == "Change Password":
             else:
                 change_user_password(st.session_state.username, new_pw)
                 st.success("Password updated successfully. Use the new password next time you sign in.")
+
+
+# ============================================================
+# MY PROFILE
+# ============================================================
 
 elif page == "My Profile":
     st.subheader("👤 My Student Profile")
