@@ -1,3 +1,4 @@
+# cache-bust-2026-09-29-1
 import io
 import re
 import zipfile
@@ -623,22 +624,453 @@ def save_school_settings():
         supabase.table("school_settings").update(payload).eq("id", 1).execute()
     except Exception as e:
         st.warning(f"Could not save settings to cloud: {e}")
-def create_backup_zip():
+def get_fee_structure(stream=None, term=None):
+    """Return fee structure rows, optionally filtered."""
+    try:
+        query = supabase.table("fee_structure").select("*")
+        if stream:
+            query = query.eq("stream", stream)
+        if term:
+            query = query.eq("term", term)
+        result = query.order("stream").order("term").execute()
+        return result.data or []
+    except Exception:
+        return []
+
+
+def set_fee_structure(stream, term, amount, description, updated_by):
+    """Create or update a fee structure entry."""
+    existing = supabase.table("fee_structure").select("id").eq("stream", stream).eq("term", term).execute()
+    payload = {
+        "stream": stream,
+        "term": term,
+        "amount": float(amount),
+        "description": description,
+        "updated_by": updated_by,
+        "updated_at": datetime.now().isoformat(),
+    }
+    if existing.data:
+        supabase.table("fee_structure").update(payload).eq("id", existing.data[0]["id"]).execute()
+    else:
+        supabase.table("fee_structure").insert(payload).execute()
+    log_fee_action(updated_by, "set_fee_structure", f"{stream} {term} = {amount}")
+
+
+def delete_fee_structure(structure_id, username):
+    """Remove a fee structure entry."""
+    supabase.table("fee_structure").delete().eq("id", structure_id).execute()
+    log_fee_action(username, "delete_fee_structure", f"id={structure_id}")
+
+
+def record_fee_payment(student_name, stream, term, amount, payment_date,
+                       payment_method, reference, recorded_by, notes=""):
+    """Insert a new fee payment."""
+    payload = {
+        "student_name": student_name,
+        "stream": stream,
+        "term": term,
+        "amount": float(amount),
+        "payment_date": str(payment_date),
+        "payment_method": payment_method,
+        "reference": reference,
+        "recorded_by": recorded_by,
+        "notes": notes,
+    }
+    result = supabase.table("fee_payments").insert(payload).execute()
+    log_fee_action(recorded_by, "record_payment",
+                   f"{student_name} {term} = {amount} ({payment_method})")
+    return result.data[0]["id"] if result.data else None
+
+
+def get_fee_payments(student_name=None, term=None, include_voided=False):
+    """Return fee payments, optionally filtered."""
+    try:
+        query = supabase.table("fee_payments").select("*")
+        if student_name:
+            query = query.eq("student_name", student_name)
+        if term:
+            query = query.eq("term", term)
+        if not include_voided:
+            query = query.eq("voided", False)
+        result = query.order("payment_date", desc=True).order("id", desc=True).execute()
+        return result.data or []
+    except Exception:
+        return []
+
+
+def void_fee_payment(payment_id, username, reason):
+    """Mark a payment as void (do not delete)."""
+    supabase.table("fee_payments").update({
+        "voided": True,
+        "voided_by": username,
+        "voided_reason": reason,
+        "voided_at": datetime.now().isoformat(),
+    }).eq("id", payment_id).execute()
+    log_fee_action(username, "void_payment", f"id={payment_id} reason={reason}")
+
+
+def get_student_fee_ledger(student_name, stream, term=None):
+    """Return expected fees, paid fees, and balance for a student."""
+    # Expected: fee structure for their stream
+    if term:
+        structure = get_fee_structure(stream=stream, term=term)
+    else:
+        structure = get_fee_structure(stream=stream)
+
+    total_expected = sum(float(s["amount"]) for s in structure)
+
+    # Paid: all non-voided payments by this student (optionally for the term)
+    payments = get_fee_payments(student_name=student_name, term=term)
+    total_paid = sum(float(p["amount"]) for p in payments)
+
+    balance = total_expected - total_paid
+
+    return {
+        "expected": total_expected,
+        "paid": total_paid,
+        "balance": balance,
+        "payments": payments,
+        "structure": structure,
+    }
+
+
+def get_fee_collection_summary(term=None):
+    """Return collection stats for a term (or all terms if None)."""
+    try:
+        if term:
+            payments = supabase.table("fee_payments").select("*").eq("term", term).eq("voided", False).execute().data or []
+        else:
+            payments = supabase.table("fee_payments").select("*").eq("voided", False).execute().data or []
+
+        total_collected = sum(float(p["amount"]) for p in payments)
+        payment_count = len(payments)
+
+        # By method
+        by_method = {}
+        for p in payments:
+            m = p.get("payment_method", "unknown")
+            by_method[m] = by_method.get(m, 0) + float(p["amount"])
+
+        return {
+            "total_collected": total_collected,
+            "payment_count": payment_count,
+            "by_method": by_method,
+            "payments": payments,
+        }
+    except Exception:
+        return {"total_collected": 0, "payment_count": 0, "by_method": {}, "payments": []}
+
+
+def log_fee_action(username, action, details=""):
+    """Write to the fee audit log."""
+    try:
+        supabase.table("fee_audit_log").insert({
+            "username": username,
+            "action": action,
+            "details": details,
+        }).execute()
+    except Exception:
+        pass
+
+
+def get_fee_audit_log(limit=100):
+    """Return recent audit log entries."""
+    try:
+        result = supabase.table("fee_audit_log").select("*").order("id", desc=True).limit(limit).execute()
+        return result.data or []
+    except Exception:
+        return []
+
+
+def generate_defaulters_pdf(rows, threshold, term_label, school_name):
+    """Generate a PDF listing students below a fee threshold."""
     buf = io.BytesIO()
-    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
-        for table in ["users", "parents", "students", "materials",
-                      "submissions", "quizzes", "quiz_questions",
-                      "quiz_attempts", "results_store"]:
-            try:
-                result = supabase.table(table).select("*").execute()
-                data = json.dumps(result.data, indent=2, default=str)
-                z.writestr(f"{table}.json", data)
-            except Exception:
-                pass
+    from reportlab.lib.pagesizes import A4
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=30, rightMargin=30, topMargin=30, bottomMargin=30
+    )
+    styles = pdf_styles()
+
+    info_style = ParagraphStyle("Info", parent=styles["cell"], fontSize=9, leading=11)
+    header_cell = ParagraphStyle("HeaderCell", parent=styles["cell"],
+                                 fontName="Helvetica-Bold", fontSize=9, leading=11,
+                                 textColor=colors.white, alignment=1)
+    cell_center = ParagraphStyle("CellCenter", parent=styles["cell"],
+                                 fontSize=9, leading=11, alignment=1)
+
+    story = []
+    pdf_school_header(
+        story, school_name, styles,
+        f"FEE DEFAULT REPORT | Threshold: KSh {threshold:,.0f}"
+    )
+    story.append(Spacer(1, 10))
+    story.append(HRFlowable(width="100%", thickness=1.2, color=colors.HexColor("#263238")))
+    story.append(Spacer(1, 8))
+
+    meta = Table([
+        [Paragraph("Report Term:", info_style), Paragraph(term_label, info_style)],
+        [Paragraph("Threshold:", info_style), Paragraph(f"KSh {threshold:,.0f} (students below are listed)", info_style)],
+        [Paragraph("Total Students:", info_style), Paragraph(str(len(rows)), info_style)],
+        [Paragraph("Generated:", info_style), Paragraph(datetime.now().strftime("%d %B %Y %H:%M"), info_style)],
+        [Paragraph("Prepared by:", info_style), Paragraph(st.session_state.get("username", ""), info_style)],
+    ], colWidths=[110, 380])
+    meta.setStyle(TableStyle([
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c9d0d6")),
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#edf1f3")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(meta)
+    story.append(Spacer(1, 12))
+
+    # Table header
+    headers = ["#", "Student", "Stream", "Expected (KSh)", "Paid (KSh)", "Balance (KSh)"]
+    table_rows = [[Paragraph(h, header_cell) for h in headers]]
+
+    for i, r in enumerate(rows, 1):
+        table_rows.append([
+            Paragraph(str(i), cell_center),
+            Paragraph(str(r["student"]), info_style),
+            Paragraph(str(r["stream"]), cell_center),
+            Paragraph(f"{r['expected']:,.0f}", cell_center),
+            Paragraph(f"{r['paid']:,.0f}", cell_center),
+            Paragraph(f"{r['balance']:,.0f}", cell_center),
+        ])
+
+    t = Table(table_rows, colWidths=[30, 170, 60, 90, 80, 90], repeatRows=1)
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#c0392b")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("GRID", (0, 0), (-1, -1), 0.35, colors.HexColor("#d7dce0")),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#fdf2f2")]),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(t)
+    story.append(Spacer(1, 14))
+    story.append(Paragraph(
+        "This list shows students who have paid LESS than the threshold. "
+        "Students who have paid the threshold or more are NOT included.",
+        styles["meta"]
+    ))
+    story.append(Spacer(1, 6))
+    story.append(Paragraph("_____________________________", info_style))
+    story.append(Paragraph("Principal / Deputy Signature & Date", styles["meta"]))
+
+    doc.build(story)
     buf.seek(0)
     return buf
+def get_all_streams_from_data():
+    """Return list of streams from the current Excel data."""
+    if st.session_state.get("data") is None:
+        return []
+    df = st.session_state.data["df"]
+    stream_col = st.session_state.data["stream_col"]
+    return sorted(df[stream_col].astype(str).unique().tolist())
 
+def generate_receipt_pdf(payment_row, school_name, balance_before, balance_after):
+    """Generate a fee payment receipt PDF with small logo top, faint logo watermark, and motto."""
+    buf = io.BytesIO()
+    from reportlab.lib.pagesizes import A5
+    from reportlab.lib.utils import ImageReader
+    doc = SimpleDocTemplate(
+        buf, pagesize=A5,
+        leftMargin=25, rightMargin=25, topMargin=20, bottomMargin=20
+    )
+    styles = pdf_styles()
 
+    page_w, page_h = A5  # 419 x 595 points
+
+    # ==========================================================
+    # Watermark: faint logo covering the middle of the receipt
+    # ==========================================================
+    def draw_watermark(canvas, doc):
+        logo = st.session_state.get("school_logo")
+        if not logo:
+            return
+        try:
+            img = ImageReader(io.BytesIO(logo))
+            iw, ih = img.getSize()
+            # Cover ~70% of page width
+            target_w = page_w * 0.72
+            scale = target_w / iw
+            target_h = ih * scale
+            x = (page_w - target_w) / 2
+            y = (page_h - target_h) / 2 + 20  # slightly higher, behind the data
+            canvas.saveState()
+            canvas.setFillAlpha(0.12)  # Light (12%)
+            canvas.drawImage(img, x, y, width=target_w, height=target_h, mask='auto')
+            canvas.restoreState()
+        except Exception:
+            pass
+
+    story = []
+
+    # ==========================================================
+    # Header with SMALL logo at the top (uses pdf_school_header)
+    # ==========================================================
+    pdf_school_header(story, school_name, styles, "FEE PAYMENT RECEIPT")
+    story.append(Spacer(1, 5))
+
+    # ==========================================================
+    # Motto #1 — under the header
+    # ==========================================================
+    motto = (st.session_state.get("school_motto") or "").strip()
+    motto_style = ParagraphStyle(
+        "Motto", parent=styles["cell"],
+        fontName="Helvetica-Oblique", fontSize=9, leading=12, alignment=1,
+        textColor=colors.HexColor("#444444")
+    )
+    if motto:
+        motto_table = Table(
+            [[Paragraph(f"“{motto}”", motto_style)]],
+            colWidths=[380]
+        )
+        motto_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#f7f9fa")),
+            ("BOX", (0, 0), (-1, -1), 0.4, colors.HexColor("#c9d0d6")),
+            ("TOPPADDING", (0, 0), (-1, -1), 5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(motto_table)
+        story.append(Spacer(1, 6))
+
+    story.append(HRFlowable(width="100%", thickness=1.2, color=colors.HexColor("#263238")))
+    story.append(Spacer(1, 6))
+
+    # ==========================================================
+    # Receipt number + date
+    # ==========================================================
+    receipt_no = f"RCP-{int(payment_row.get('id', 0)):06d}"
+    pay_date = str(payment_row.get("payment_date", ""))
+
+    info_style = ParagraphStyle("Info", parent=styles["cell"], fontSize=9, leading=11)
+    header_style = ParagraphStyle("HeaderX", parent=styles["cell"], fontName="Helvetica-Bold", fontSize=9, leading=11)
+    big_number = ParagraphStyle("BigNum", parent=styles["cell"], fontName="Helvetica-Bold", fontSize=12, leading=15, alignment=1)
+
+    top = Table([
+        [Paragraph("Receipt No:", header_style), Paragraph(receipt_no, info_style),
+         Paragraph("Date:", header_style), Paragraph(pay_date, info_style)]
+    ], colWidths=[70, 130, 45, 135])
+    top.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#edf1f3")),
+        ("BACKGROUND", (2, 0), (2, -1), colors.HexColor("#edf1f3")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c9d0d6")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 4),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(top)
+    story.append(Spacer(1, 6))
+
+    # ==========================================================
+    # Student + Payment details
+    # ==========================================================
+    details = [
+        [Paragraph("Student", header_style), Paragraph(str(payment_row.get("student_name", "")), info_style)],
+        [Paragraph("Stream", header_style), Paragraph(str(payment_row.get("stream", "")), info_style)],
+        [Paragraph("Term", header_style), Paragraph((payment_row.get("term") or "").upper(), info_style)],
+        [Paragraph("Method", header_style), Paragraph(str(payment_row.get("payment_method", "")), info_style)],
+        [Paragraph("Reference", header_style), Paragraph(str(payment_row.get("reference", "")) or "—", info_style)],
+    ]
+    details_table = Table(details, colWidths=[75, 305])
+    details_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#f7f9fa")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c9d0d6")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 5),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 5),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]))
+    story.append(details_table)
+    story.append(Spacer(1, 8))
+
+    # ==========================================================
+    # Amount breakdown
+    # ==========================================================
+    amount = float(payment_row.get("amount", 0))
+    amount_table = Table([
+        [Paragraph("Previous Balance", header_style), Paragraph(f"KSh {balance_before:,.0f}", info_style)],
+        [Paragraph("Amount Paid Now", header_style), Paragraph(f"KSh {amount:,.0f}", info_style)],
+        [Paragraph("New Balance", header_style), Paragraph(f"KSh {balance_after:,.0f}", info_style)],
+    ], colWidths=[140, 240])
+    amount_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#edf1f3")),
+        ("BACKGROUND", (0, 1), (0, 1), colors.HexColor("#fff3cd")),
+        ("BACKGROUND", (0, 2), (0, 2), colors.HexColor("#d4edda") if balance_after <= 0 else colors.HexColor("#f8d7da")),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#c9d0d6")),
+        ("LEFTPADDING", (0, 0), (-1, -1), 6),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+    ]))
+    story.append(amount_table)
+    story.append(Spacer(1, 10))
+
+    # ==========================================================
+    # Big total box
+    # ==========================================================
+    total_box = Table([
+        [Paragraph(f"TOTAL RECEIVED:  KSh {amount:,.0f}", big_number)]
+    ], colWidths=[380])
+    total_box.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#263238")),
+        ("TEXTCOLOR", (0, 0), (-1, -1), colors.white),
+        ("BOX", (0, 0), (-1, -1), 1, colors.HexColor("#263238")),
+        ("TOPPADDING", (0, 0), (-1, -1), 8),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(total_box)
+    story.append(Spacer(1, 12))
+
+    # ==========================================================
+    # Motto #2 — above the signature line
+    # ==========================================================
+    if motto:
+        story.append(Paragraph(f"“{motto}”", motto_style))
+        story.append(Spacer(1, 8))
+
+    # ==========================================================
+    # Received by
+    # ==========================================================
+    recv_by = str(payment_row.get("recorded_by", ""))
+    received = Table([
+        [Paragraph("Received by:", header_style), Paragraph(recv_by, info_style)],
+        [Paragraph("Date:", header_style), Paragraph(pay_date, info_style)],
+    ], colWidths=[80, 300])
+    received.setStyle(TableStyle([
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("LEFTPADDING", (0, 0), (-1, -1), 0),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]))
+    story.append(received)
+    story.append(Spacer(1, 14))
+    story.append(Paragraph("_____________________________", info_style))
+    story.append(Paragraph("Authorized Signature & School Stamp", styles["meta"]))
+    story.append(Spacer(1, 8))
+    story.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#999999")))
+    story.append(Paragraph(
+        "Thank you for your payment. Retain this receipt for your records.",
+        styles["meta"]
+    ))
+
+    doc.build(story, onFirstPage=draw_watermark, onLaterPages=draw_watermark)
+    buf.seek(0)
+    return buf
 # ============================================================
 # DATA PREPARATION
 # ============================================================
@@ -938,21 +1370,33 @@ def pdf_styles():
 
 def pdf_school_header(story, school_name, styles, report_subtitle):
     logo = st.session_state.get("school_logo")
+    logo_rendered = False
     if logo:
         try:
             logo_buf = io.BytesIO(logo)
-            logo_img = Image(logo_buf, width=0.65*inch, height=0.65*inch)
-            header = Table([[logo_img, Paragraph(school_name, styles["title"])]],
-                           colWidths=[0.85*inch, 8.0*inch])
+            logo_img = Image(logo_buf, width=0.75*inch, height=0.75*inch)
+            # Two-column header: [logo | school name]
+            header = Table(
+                [[logo_img, Paragraph(school_name, styles["title"])]],
+                                colWidths=[0.9*inch, 4.2*inch]
+            )
             header.setStyle(TableStyle([
                 ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
                 ("ALIGN", (1, 0), (1, 0), "CENTER"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
             ]))
             story.append(header)
-        except Exception:
-            story.append(Paragraph(school_name, styles["title"]))
-    else:
+            logo_rendered = True
+        except Exception as e:
+            # If logo rendering fails, fall through to just the school name
+            logo_rendered = False
+
+    if not logo_rendered:
         story.append(Paragraph(school_name, styles["title"]))
+
     contact = " • ".join([x for x in [
         st.session_state.get("school_address", ""),
         st.session_state.get("school_phone", ""),
@@ -962,7 +1406,6 @@ def pdf_school_header(story, school_name, styles, report_subtitle):
         story.append(Paragraph(contact, styles["meta"]))
         story.append(Spacer(1, 2))
     story.append(Paragraph(report_subtitle, styles["meta"]))
-
 
 def build_merit_table(frame, data, footer_label):
     styles = pdf_styles()
@@ -1341,6 +1784,7 @@ defaults = {
     "class_teacher_name": "Class Teacher",
     "principal_name": "Principal / Head Teacher",
     "principal_comment": "Congratulations on your progress. Continue working hard and remain disciplined.",
+    "school_motto": "Learn • Grow • Succeed",
     "teacher_comments": {},
     "teacher_signature": None,
     "principal_signature": None,
@@ -1376,7 +1820,7 @@ def login_screen():
 
     left, center, right = st.columns([1, 1.4, 1])
     with center:
-        role = st.selectbox("Login as", ["Administrator", "Teacher", "Student", "Parent"])
+        role = st.selectbox("Login as", ["Administrator", "Teacher", "Student", "Parent", "Clerk"])
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
 
@@ -1388,6 +1832,7 @@ def login_screen():
                     or (role == "Teacher" and user["role"] == "teacher")
                     or (role == "Student" and user["role"] == "student")
                     or (role == "Parent" and user["role"] == "parent")
+                    or (role == "Clerk" and user["role"] == "clerk")
                 )
                 if not valid_role:
                     user = None
@@ -1522,14 +1967,16 @@ st.markdown(
 # NAVIGATION
 # ============================================================
 
-if st.session_state.user_role == "student":
+if st.session_state.user_role == "clerk":
+    nav_items = ["💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Change Password"]
+elif st.session_state.user_role == "student":
     nav_items = ["My Dashboard", "Learning Centre", "Online Tests & Quizzes", "My Profile", "Change Password"]
 elif st.session_state.user_role == "parent":
     nav_items = ["Parent Portal", "Change Password"]
 elif st.session_state.user_role == "teacher":
-    nav_items = ["Dashboard", "Students", "Academic Results", "Streams", "Master Merit List", "Reports", "Learning Centre", "Online Tests & Quizzes", "Settings"]
+    nav_items = ["Dashboard", "Students", "Academic Results", "Streams", "Master Merit List", "Reports", "Learning Centre", "Online Tests & Quizzes", "💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Settings"]
 else:
-    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "Settings"]
+    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Settings"]
 
 page = st.sidebar.radio("Navigation", nav_items)
 st.sidebar.caption(f"Signed in as: **{st.session_state.user_role.title()}**")
@@ -1671,6 +2118,104 @@ if page == "Parent Portal":
                     st.caption(f"Posted {m.get('created_at','')}")
     except Exception:
         pass
+
+    # ============================================================
+    # 💰 FEE STATUS (Parent view)
+    # ============================================================
+    st.divider()
+    st.markdown("### 💰 Fee Status")
+    st.caption("Your child's fee balance and payment history.")
+
+    try:
+        ledger = get_student_fee_ledger(str(student[name_col]), str(student[stream_col]))
+
+        if ledger["expected"] == 0 and ledger["paid"] == 0:
+            st.info("No fee structure has been set for your child's stream yet. Please contact the school.")
+        else:
+            fc1, fc2, fc3 = st.columns(3)
+            fc1.metric("Total Expected", f"KSh {ledger['expected']:,.0f}")
+            fc2.metric("Total Paid", f"KSh {ledger['paid']:,.0f}")
+            bal = ledger["balance"]
+            fc3.metric(
+                "Balance",
+                f"KSh {bal:,.0f}",
+                delta=None if bal == 0 else ("Settled ✅" if bal <= 0 else "Outstanding")
+            )
+
+            st.markdown("### 📅 Term-by-Term Breakdown")
+            term_rows = []
+            for term in TERMS:
+                structure = get_fee_structure(stream=str(student[stream_col]), term=term)
+                expected_term = sum(float(s["amount"]) for s in structure)
+                payments_term = get_fee_payments(student_name=str(student[name_col]), term=term)
+                paid_term = sum(float(p["amount"]) for p in payments_term)
+                balance_term = expected_term - paid_term
+                term_rows.append({
+                    "Term": term.upper(),
+                    "Expected (KSh)": f"{expected_term:,.0f}",
+                    "Paid (KSh)": f"{paid_term:,.0f}",
+                    "Balance (KSh)": f"{balance_term:,.0f}",
+                    "Status": "✅ Settled" if balance_term <= 0 and expected_term > 0
+                              else ("⚠️ Partial" if paid_term > 0 and balance_term > 0
+                                    else ("❌ Not paid" if expected_term > 0 else "—"))
+                })
+            st.dataframe(pd.DataFrame(term_rows), use_container_width=True, hide_index=True)
+
+            st.markdown("### 📜 Payment History")
+            payments = ledger.get("payments", [])
+            if not payments:
+                st.info("No payments recorded yet.")
+            else:
+                pay_rows = []
+                for p in payments:
+                    pay_rows.append({
+                        "Date": p.get("payment_date", ""),
+                        "Term": (p.get("term") or "").upper(),
+                        "Amount (KSh)": f"{float(p.get('amount', 0)):,.0f}",
+                        "Method": p.get("payment_method", ""),
+                        "Reference": p.get("reference", ""),
+                    })
+                st.dataframe(pd.DataFrame(pay_rows), use_container_width=True, hide_index=True)
+
+            if st.button("📥 Prepare Fee Statement (CSV)", type="primary", key="parent_fee_stmt"):
+                statement_rows = []
+                statement_rows.append(["Student", str(student[name_col])])
+                statement_rows.append(["Stream", str(student[stream_col])])
+                statement_rows.append([])
+                statement_rows.append(["Term", "Expected", "Paid", "Balance"])
+                for term in TERMS:
+                    structure = get_fee_structure(stream=str(student[stream_col]), term=term)
+                    expected_term = sum(float(s["amount"]) for s in structure)
+                    payments_term = get_fee_payments(student_name=str(student[name_col]), term=term)
+                    paid_term = sum(float(p["amount"]) for p in payments_term)
+                    statement_rows.append([term.upper(), expected_term, paid_term, expected_term - paid_term])
+                statement_rows.append([])
+                statement_rows.append(["Date", "Term", "Amount", "Method", "Reference"])
+                for p in payments:
+                    statement_rows.append([
+                        p.get("payment_date", ""),
+                        (p.get("term") or "").upper(),
+                        float(p.get("amount", 0)),
+                        p.get("payment_method", ""),
+                        p.get("reference", ""),
+                    ])
+                statement_rows.append([])
+                statement_rows.append(["TOTAL PAID", ledger["paid"]])
+                statement_rows.append(["BALANCE", ledger["balance"]])
+
+                csv_df = pd.DataFrame(statement_rows)
+                csv_bytes = csv_df.to_csv(index=False, header=False).encode("utf-8")
+                safe_student = re.sub(r"[^A-Za-z0-9_-]+", "_", str(student[name_col])).strip("_")
+                st.download_button(
+                    "⬇️ Download Fee Statement (CSV)",
+                    data=csv_bytes,
+                    file_name=f"Fee_Statement_{safe_student}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="parent_fee_dl"
+                )
+    except Exception as e:
+        st.warning(f"Fee information is not available yet: {e}")
 
     st.stop()
 
@@ -2939,18 +3484,957 @@ elif page == "My Profile":
 # SETTINGS
 # ============================================================
 
+elif page == "💰 Fee Structure":
+    if st.session_state.user_role not in ["admin", "clerk"]:
+        st.error("🔒 You don't have access to fee pages.")
+        st.stop()
+    st.subheader("💰 Fee Structure")
+    st.caption("Set the amount each stream pays per term. This feeds into student fee balances.")
+
+    streams_available = get_all_streams_from_data()
+
+    with st.expander("➕ Add / Update Fee Structure", expanded=True):
+        if not streams_available:
+            st.warning("No streams detected. Upload your student Excel file first.")
+        else:
+            fc1, fc2, fc3 = st.columns(3)
+            with fc1:
+                new_stream = st.selectbox("Stream", streams_available, key="fee_struct_stream")
+            with fc2:
+                new_term = st.selectbox("Term", TERMS, key="fee_struct_term")
+            with fc3:
+                new_amount = st.number_input("Amount (KSh)", min_value=0.0, value=0.0, step=500.0, key="fee_struct_amount")
+
+            new_desc = st.text_input("Description (optional)", placeholder="e.g. Term 3 tuition", key="fee_struct_desc")
+
+            if st.button("💾 Save Fee Structure", type="primary", use_container_width=True, key="fee_struct_save"):
+                if new_amount <= 0:
+                    st.error("Enter an amount greater than 0.")
+                else:
+                    try:
+                        set_fee_structure(new_stream, new_term, new_amount, new_desc.strip(), st.session_state.username)
+                        st.success(f"✅ {new_stream} — {new_term.upper()} = KSh {new_amount:,.0f}")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error saving: {e}")
+
+    st.divider()
+    st.markdown("### 📋 Current Fee Structure")
+    structures = get_fee_structure()
+    if not structures:
+        st.info("No fee structure set yet. Add one above.")
+    else:
+        df_fs = pd.DataFrame(structures)
+        df_fs = df_fs[["stream", "term", "amount", "description", "updated_by", "updated_at"]]
+        df_fs.columns = ["Stream", "Term", "Amount (KSh)", "Description", "Updated By", "Updated At"]
+        df_fs["Term"] = df_fs["Term"].str.upper()
+        df_fs["Amount (KSh)"] = df_fs["Amount (KSh)"].apply(lambda x: f"{float(x):,.0f}")
+        st.dataframe(df_fs, use_container_width=True, hide_index=True)
+
+        with st.expander("🗑️ Delete a fee structure entry"):
+            del_options = {f"{s['stream']} — {s['term'].upper()} — KSh {float(s['amount']):,.0f}": s["id"] for s in structures}
+            selected_label = st.selectbox("Select entry", list(del_options.keys()), key="fee_del_select")
+            confirm_del = st.checkbox("I understand this will remove the fee structure entry.", key="fee_del_confirm")
+            if st.button("Delete", type="secondary", disabled=not confirm_del, key="fee_del_btn"):
+                try:
+                    delete_fee_structure(del_options[selected_label], st.session_state.username)
+                    st.success("Deleted.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+
+    st.divider()
+    st.markdown("### 🧪 Quick Test — Student Balance")
+    st.caption("Enter a student name to see their fee balance.")
+    test_student = st.text_input("Student name", key="fee_test_student", placeholder="e.g. JOHN MWANGI")
+    if test_student and streams_available:
+        student_stream = ""
+        if st.session_state.get("data") is not None:
+            tdf = st.session_state.data["df"]
+            tname = st.session_state.data["name_col"]
+            tstream = st.session_state.data["stream_col"]
+            hit = tdf[tdf[tname].astype(str).str.strip().str.lower() == test_student.strip().lower()]
+            if not hit.empty:
+                student_stream = str(hit.iloc[0][tstream])
+
+        if student_stream:
+            st.write(f"**Stream:** {student_stream}")
+            ledger = get_student_fee_ledger(test_student.strip(), student_stream)
+            c1, c2, c3 = st.columns(3)
+            c1.metric("Expected", f"KSh {ledger['expected']:,.0f}")
+            c2.metric("Paid", f"KSh {ledger['paid']:,.0f}")
+            c3.metric("Balance", f"KSh {ledger['balance']:,.0f}")
+        else:
+            st.warning("Student not found in the loaded Excel data.")
+
+elif page == "💵 Record Payment":
+    if st.session_state.user_role not in ["admin", "clerk"]:
+        st.error("🔒 You don't have access to fee pages.")
+        st.stop()
+    st.subheader("💵 Record Fee Payment")
+    st.caption("Log a payment received from a student. This updates their fee balance automatically.")
+
+    streams_available = get_all_streams_from_data()
+
+    if not streams_available:
+        st.warning("No student data loaded. Upload your Excel file first.")
+        st.stop()
+
+    # --- Step 1: Select student ---
+    with st.expander("➕ Record New Payment", expanded=True):
+        # Build a list of students with their streams
+        student_options = []
+        if st.session_state.get("data") is not None:
+            sdf = st.session_state.data["df"]
+            sname = st.session_state.data["name_col"]
+            sstream = st.session_state.data["stream_col"]
+            student_options = [
+                (str(row[sname]), str(row[sstream]))
+                for _, row in sdf.iterrows()
+            ]
+
+        # Filter by stream to make it easier
+        stream_filter = st.selectbox(
+            "Filter by stream",
+            ["ALL STREAMS"] + streams_available,
+            key="payment_stream_filter"
+        )
+
+        filtered_students = student_options
+        if stream_filter != "ALL STREAMS":
+            filtered_students = [(n, s) for n, s in student_options if s == stream_filter]
+
+        if not filtered_students:
+            st.info("No students found for that stream.")
+            st.stop()
+
+        student_labels = [f"{n} — {s}" for n, s in filtered_students]
+        selected_label = st.selectbox("Select student", student_labels, key="payment_student_select")
+        selected_idx = student_labels.index(selected_label)
+        sel_student, sel_stream = filtered_students[selected_idx]
+
+        st.markdown(f"**Student:** {sel_student}  •  **Stream:** {sel_stream}")
+
+        # Show current balance
+        ledger = get_student_fee_ledger(sel_student, sel_stream)
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Expected (all terms)", f"KSh {ledger['expected']:,.0f}")
+        c2.metric("Paid so far", f"KSh {ledger['paid']:,.0f}")
+        c3.metric("Balance", f"KSh {ledger['balance']:,.0f}")
+
+        st.divider()
+
+        # Payment entry
+        p1, p2 = st.columns(2)
+        with p1:
+            pay_amount = st.number_input("Amount received (KSh)", min_value=0.0, value=0.0, step=500.0, key="payment_amount")
+            pay_date = st.date_input("Payment date", value=date.today(), key="payment_date")
+        with p2:
+            pay_term = st.selectbox("Term", TERMS, key="payment_term")
+            pay_method = st.selectbox("Payment method", ["cash", "M-Pesa", "bank", "cheque", "other"], key="payment_method")
+
+        pay_ref = st.text_input("Reference (optional)", placeholder="e.g. M-Pesa code QK123456", key="payment_ref")
+        pay_notes = st.text_area("Notes (optional)", height=60, key="payment_notes")
+
+        if st.button("💾 Record Payment", type="primary", use_container_width=True, key="payment_save"):
+            if pay_amount <= 0:
+                st.error("Amount must be greater than 0.")
+            else:
+                try:
+                    payment_id = record_fee_payment(
+                        sel_student, sel_stream, pay_term, pay_amount,
+                        pay_date, pay_method, pay_ref.strip(),
+                        st.session_state.username, pay_notes.strip()
+                    )
+                    st.success(f"✅ Recorded KSh {pay_amount:,.0f} from {sel_student} for {pay_term.upper()} ({pay_method}).")
+                    st.session_state["last_payment_id"] = payment_id
+                    st.session_state["last_payment_student"] = sel_student
+                    st.session_state["last_payment_stream"] = sel_stream
+                    st.session_state["last_payment_amount"] = pay_amount
+                    st.session_state["last_payment_term"] = pay_term
+                    st.session_state["last_payment_date"] = pay_date
+                    st.session_state["last_payment_method"] = pay_method
+                    st.session_state["last_payment_ref"] = pay_ref.strip()
+                    st.session_state["last_payment_notes"] = pay_notes.strip()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error recording payment: {e}")
+
+    # --- Step 2: Recent payments ---
+    # --- Show download receipt button if a payment was just made ---
+    if st.session_state.get("last_payment_id"):
+        st.divider()
+        st.success(f"✅ Last payment: KSh {st.session_state.get('last_payment_amount', 0):,.0f} from {st.session_state.get('last_payment_student', '')}")
+        if st.button("📄 Generate Receipt PDF", type="primary", key="generate_receipt_btn"):
+            # Recompute balance before and after
+            pmt = {
+                "id": st.session_state["last_payment_id"],
+                "student_name": st.session_state["last_payment_student"],
+                "stream": st.session_state["last_payment_stream"],
+                "amount": st.session_state["last_payment_amount"],
+                "term": st.session_state["last_payment_term"],
+                "payment_date": st.session_state["last_payment_date"],
+                "payment_method": st.session_state["last_payment_method"],
+                "reference": st.session_state["last_payment_ref"],
+                "notes": st.session_state["last_payment_notes"],
+                "recorded_by": st.session_state.username,
+            }
+            ledger = get_student_fee_ledger(pmt["student_name"], pmt["stream"])
+            balance_after = ledger["balance"]
+            balance_before = balance_after + float(pmt["amount"])
+            receipt_pdf = generate_receipt_pdf(pmt, st.session_state.school_name, balance_before, balance_after)
+            safe = re.sub(r"[^A-Za-z0-9_-]+", "_", pmt["student_name"]).strip("_")
+            st.download_button(
+                "⬇️ Download Receipt PDF",
+                data=receipt_pdf.getvalue(),
+                file_name=f"Receipt_{pmt['id']}_{safe}.pdf",
+                mime="application/pdf",
+                use_container_width=True,
+                key="download_receipt_btn"
+            )
+        if st.button("✖ Clear", key="clear_last_payment_btn"):
+            for k in ["last_payment_id", "last_payment_student", "last_payment_stream",
+                      "last_payment_amount", "last_payment_term", "last_payment_date",
+                      "last_payment_method", "last_payment_ref", "last_payment_notes"]:
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    st.divider()
+    st.markdown("### 📋 Recent Payments")
+    st.caption("Latest 50 payments recorded across the school.")
+
+    recent = get_fee_payments(include_voided=False)
+    recent = recent[:50]
+
+    if not recent:
+        st.info("No payments recorded yet.")
+    else:
+        rows = []
+        for p in recent:
+            rows.append({
+                "Date": p.get("payment_date", ""),
+                "Student": p.get("student_name", ""),
+                "Stream": p.get("stream", ""),
+                "Term": (p.get("term") or "").upper(),
+                "Amount (KSh)": f"{float(p.get('amount', 0)):,.0f}",
+                "Method": p.get("payment_method", ""),
+                "Reference": p.get("reference", ""),
+                "Recorded By": p.get("recorded_by", ""),
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # --- Step 3: Void a payment ---
+    with st.expander("🗑️ Void (cancel) a payment"):
+        st.caption("Voiding does not delete the record — it marks it as cancelled for the audit log.")
+        if recent:
+            void_options = {
+                f"#{p['id']} — {p['student_name']} — KSh {float(p['amount']):,.0f} — {p.get('payment_date','')}": p["id"]
+                for p in recent
+            }
+            void_label = st.selectbox("Select payment to void", list(void_options.keys()), key="void_payment_select")
+            void_reason = st.text_input("Reason for voiding", placeholder="e.g. duplicate entry", key="void_reason")
+            void_confirm = st.checkbox("I understand this payment will be marked as void.", key="void_confirm")
+            if st.button("Void Payment", type="secondary", disabled=not void_confirm, key="void_payment_btn"):
+                if not void_reason.strip():
+                    st.error("Enter a reason.")
+                else:
+                    try:
+                        void_fee_payment(void_options[void_label], st.session_state.username, void_reason.strip())
+                        st.success("Payment voided.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+        else:
+            st.info("No payments to void.")
+elif page == "📒 Student Ledger":
+    if st.session_state.user_role not in ["admin", "clerk"]:
+        st.error("🔒 You don't have access to fee pages.")
+        st.stop()
+    st.subheader("📒 Student Fee Ledger")
+    st.caption("View a student's complete fee history — expected, paid, and balance.")
+
+    streams_available = get_all_streams_from_data()
+
+    if not streams_available:
+        st.warning("No student data loaded. Upload your Excel file first.")
+        st.stop()
+
+    # --- Search & select student ---
+    sc1, sc2 = st.columns([2, 1])
+    with sc1:
+        search_name = st.text_input("🔎 Search student name", placeholder="Type part of a name", key="ledger_search")
+    with sc2:
+        ledger_stream_filter = st.selectbox(
+            "Filter by stream",
+            ["ALL STREAMS"] + streams_available,
+            key="ledger_stream_filter"
+        )
+
+    # Build the student list from Excel data
+    student_options = []
+    if st.session_state.get("data") is not None:
+        sdf = st.session_state.data["df"]
+        sname = st.session_state.data["name_col"]
+        sstream = st.session_state.data["stream_col"]
+        for _, row in sdf.iterrows():
+            n = str(row[sname])
+            s = str(row[sstream])
+            if ledger_stream_filter != "ALL STREAMS" and s != ledger_stream_filter:
+                continue
+            if search_name and search_name.lower() not in n.lower():
+                continue
+            student_options.append((n, s))
+
+    if not student_options:
+        st.info("No students match the search.")
+        st.stop()
+
+    # Select student
+    student_labels = [f"{n} — {s}" for n, s in student_options]
+    selected_label = st.selectbox("Select student", student_labels, key="ledger_student_select")
+    selected_idx = student_labels.index(selected_label)
+    sel_student, sel_stream = student_options[selected_idx]
+
+    st.markdown(f"### 👤 {sel_student}")
+    st.caption(f"Stream: **{sel_stream}**")
+
+    # --- Overall balance across all terms ---
+    ledger = get_student_fee_ledger(sel_student, sel_stream)
+
+    st.divider()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Expected", f"KSh {ledger['expected']:,.0f}")
+    c2.metric("Total Paid", f"KSh {ledger['paid']:,.0f}")
+    balance = ledger["balance"]
+    c3.metric(
+        "Balance",
+        f"KSh {balance:,.0f}",
+        delta=None if balance == 0 else ("Settled ✅" if balance <= 0 else "Owes")
+    )
+
+    # --- Term-by-term breakdown ---
+    st.divider()
+    st.markdown("### 📅 Term-by-Term Breakdown")
+
+    term_rows = []
+    for term in TERMS:
+        structure = get_fee_structure(stream=sel_stream, term=term)
+        expected_term = sum(float(s["amount"]) for s in structure)
+        payments_term = get_fee_payments(student_name=sel_student, term=term)
+        paid_term = sum(float(p["amount"]) for p in payments_term)
+        balance_term = expected_term - paid_term
+        term_rows.append({
+            "Term": term.upper(),
+            "Expected (KSh)": f"{expected_term:,.0f}",
+            "Paid (KSh)": f"{paid_term:,.0f}",
+            "Balance (KSh)": f"{balance_term:,.0f}",
+            "Status": "✅ Settled" if balance_term <= 0 and expected_term > 0 else
+                      ("⚠️ Partial" if paid_term > 0 and balance_term > 0 else
+                       ("❌ Not paid" if expected_term > 0 else "—"))
+        })
+
+    st.dataframe(pd.DataFrame(term_rows), use_container_width=True, hide_index=True)
+
+    # --- Payment history ---
+    st.divider()
+    st.markdown("### 📜 Payment History")
+
+    payments = get_fee_payments(student_name=sel_student)
+    if not payments:
+        st.info("No payments recorded yet for this student.")
+    else:
+        for p in payments:
+            with st.container(border=True):
+                pc1, pc2, pc3 = st.columns([2, 2, 1])
+                with pc1:
+                    st.markdown(f"**{str(p.get('payment_date', ''))}** — {(p.get('term') or '').upper()}")
+                    st.caption(f"{p.get('payment_method', '').title()}"
+                               + (f" • {p.get('reference', '')}" if p.get('reference') else ""))
+                with pc2:
+                    st.markdown(f"### KSh {float(p.get('amount', 0)):,.0f}")
+                    st.caption(f"Recorded by {p.get('recorded_by', '')}")
+                with pc3:
+                    if st.button("📄 Receipt", key=f"receipt_btn_{p['id']}"):
+                        # Recompute balance before/after for this payment
+                        # Simple version: current balance + this payment = before
+                        # We don't have historical snapshots, so we compute the current balance
+                        # and treat "before" as balance + amount
+                        current_ledger = get_student_fee_ledger(sel_student, sel_stream)
+                        # Find the running balance at this payment's point in time
+                        # Simplification: balance after = current + all payments made AFTER this one
+                        # Since payments are sorted newest first, sum the amounts of earlier payments (newer ones)
+                        amount_this = float(p.get("amount", 0))
+                        balance_after_this = current_ledger["balance"] + sum(
+                            float(pp.get("amount", 0)) for pp in payments
+                            if pp["id"] > p["id"]
+                        )
+                        balance_before_this = balance_after_this + amount_this
+                        receipt_pdf = generate_receipt_pdf(p, st.session_state.school_name, balance_before_this, balance_after_this)
+                        safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(p.get("student_name", "student"))).strip("_")
+                        st.download_button(
+                            "⬇️ Download",
+                            data=receipt_pdf.getvalue(),
+                            file_name=f"Receipt_{p['id']}_{safe}.pdf",
+                            mime="application/pdf",
+                            key=f"receipt_dl_{p['id']}"
+                        )
+                if p.get("notes"):
+                    st.caption(f"📝 {p.get('notes', '')}")
+
+    # --- Download statement ---
+    st.divider()
+    st.markdown("### 📄 Download Fee Statement")
+    st.caption("Download a simple statement as CSV — you can open it in Excel and print for the parent.")
+
+    if st.button("📥 Prepare Statement (CSV)", type="primary", key="ledger_download_btn"):
+        statement_rows = []
+        statement_rows.append(["Student", sel_student])
+        statement_rows.append(["Stream", sel_stream])
+        statement_rows.append([])
+        statement_rows.append(["Term", "Expected", "Paid", "Balance"])
+        for term in TERMS:
+            structure = get_fee_structure(stream=sel_stream, term=term)
+            expected_term = sum(float(s["amount"]) for s in structure)
+            payments_term = get_fee_payments(student_name=sel_student, term=term)
+            paid_term = sum(float(p["amount"]) for p in payments_term)
+            statement_rows.append([term.upper(), expected_term, paid_term, expected_term - paid_term])
+        statement_rows.append([])
+        statement_rows.append(["Date", "Term", "Amount", "Method", "Reference", "Recorded By"])
+        for p in payments:
+            statement_rows.append([
+                p.get("payment_date", ""),
+                (p.get("term") or "").upper(),
+                float(p.get("amount", 0)),
+                p.get("payment_method", ""),
+                p.get("reference", ""),
+                p.get("recorded_by", ""),
+            ])
+        statement_rows.append([])
+        statement_rows.append(["TOTAL PAID", ledger["paid"]])
+        statement_rows.append(["BALANCE", ledger["balance"]])
+
+        csv_df = pd.DataFrame(statement_rows)
+        csv_bytes = csv_df.to_csv(index=False, header=False).encode("utf-8")
+        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", sel_student).strip("_")
+        st.download_button(
+            "⬇️ Download Statement CSV",
+            data=csv_bytes,
+            file_name=f"Fee_Statement_{safe_name}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
+elif page == "📒 Student Ledger":
+    st.subheader("📒 Student Fee Ledger")
+    st.caption("View a student's complete fee history — expected, paid, and balance.")
+
+    streams_available = get_all_streams_from_data()
+
+    if not streams_available:
+        st.warning("No student data loaded. Upload your Excel file first.")
+        st.stop()
+
+    sc1, sc2 = st.columns([2, 1])
+    with sc1:
+        search_name = st.text_input("🔎 Search student name", placeholder="Type part of a name", key="ledger_search")
+    with sc2:
+        ledger_stream_filter = st.selectbox(
+            "Filter by stream",
+            ["ALL STREAMS"] + streams_available,
+            key="ledger_stream_filter"
+        )
+
+    student_options = []
+    if st.session_state.get("data") is not None:
+        sdf = st.session_state.data["df"]
+        sname = st.session_state.data["name_col"]
+        sstream = st.session_state.data["stream_col"]
+        for _, row in sdf.iterrows():
+            n = str(row[sname])
+            s = str(row[sstream])
+            if ledger_stream_filter != "ALL STREAMS" and s != ledger_stream_filter:
+                continue
+            if search_name and search_name.lower() not in n.lower():
+                continue
+            student_options.append((n, s))
+
+    if not student_options:
+        st.info("No students match the search.")
+        st.stop()
+
+    student_labels = [f"{n} — {s}" for n, s in student_options]
+    selected_label = st.selectbox("Select student", student_labels, key="ledger_student_select")
+    selected_idx = student_labels.index(selected_label)
+    sel_student, sel_stream = student_options[selected_idx]
+
+    st.markdown(f"### 👤 {sel_student}")
+    st.caption(f"Stream: **{sel_stream}**")
+
+    ledger = get_student_fee_ledger(sel_student, sel_stream)
+
+    st.divider()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Expected", f"KSh {ledger['expected']:,.0f}")
+    c2.metric("Total Paid", f"KSh {ledger['paid']:,.0f}")
+    balance = ledger["balance"]
+    c3.metric(
+        "Balance",
+        f"KSh {balance:,.0f}",
+        delta=None if balance == 0 else ("Settled ✅" if balance <= 0 else "Owes")
+    )
+
+    st.divider()
+    st.markdown("### 📅 Term-by-Term Breakdown")
+
+    term_rows = []
+    for term in TERMS:
+        structure = get_fee_structure(stream=sel_stream, term=term)
+        expected_term = sum(float(s["amount"]) for s in structure)
+        payments_term = get_fee_payments(student_name=sel_student, term=term)
+        paid_term = sum(float(p["amount"]) for p in payments_term)
+        balance_term = expected_term - paid_term
+        term_rows.append({
+            "Term": term.upper(),
+            "Expected (KSh)": f"{expected_term:,.0f}",
+            "Paid (KSh)": f"{paid_term:,.0f}",
+            "Balance (KSh)": f"{balance_term:,.0f}",
+            "Status": "✅ Settled" if balance_term <= 0 and expected_term > 0 else
+                      ("⚠️ Partial" if paid_term > 0 and balance_term > 0 else
+                       ("❌ Not paid" if expected_term > 0 else "—"))
+        })
+
+    st.dataframe(pd.DataFrame(term_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### 📜 Payment History")
+
+    payments = get_fee_payments(student_name=sel_student)
+    if not payments:
+        st.info("No payments recorded yet for this student.")
+    else:
+        pay_rows = []
+        for p in payments:
+            pay_rows.append({
+                "Date": p.get("payment_date", ""),
+                "Term": (p.get("term") or "").upper(),
+                "Amount (KSh)": f"{float(p.get('amount', 0)):,.0f}",
+                "Method": p.get("payment_method", ""),
+                "Reference": p.get("reference", ""),
+                "Recorded By": p.get("recorded_by", ""),
+                "Notes": p.get("notes", ""),
+            })
+        st.dataframe(pd.DataFrame(pay_rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("### 📄 Download Fee Statement")
+    st.caption("Download a simple statement as CSV — you can open it in Excel and print for the parent.")
+
+    if st.button("📥 Prepare Statement (CSV)", type="primary", key="ledger_download_btn"):
+        statement_rows = []
+        statement_rows.append(["Student", sel_student])
+        statement_rows.append(["Stream", sel_stream])
+        statement_rows.append([])
+        statement_rows.append(["Term", "Expected", "Paid", "Balance"])
+        for term in TERMS:
+            structure = get_fee_structure(stream=sel_stream, term=term)
+            expected_term = sum(float(s["amount"]) for s in structure)
+            payments_term = get_fee_payments(student_name=sel_student, term=term)
+            paid_term = sum(float(p["amount"]) for p in payments_term)
+            statement_rows.append([term.upper(), expected_term, paid_term, expected_term - paid_term])
+        statement_rows.append([])
+        statement_rows.append(["Date", "Term", "Amount", "Method", "Reference", "Recorded By"])
+        for p in payments:
+            statement_rows.append([
+                p.get("payment_date", ""),
+                (p.get("term") or "").upper(),
+                float(p.get("amount", 0)),
+                p.get("payment_method", ""),
+                p.get("reference", ""),
+                p.get("recorded_by", ""),
+            ])
+        statement_rows.append([])
+        statement_rows.append(["TOTAL PAID", ledger["paid"]])
+        statement_rows.append(["BALANCE", ledger["balance"]])
+
+        csv_df = pd.DataFrame(statement_rows)
+        csv_bytes = csv_df.to_csv(index=False, header=False).encode("utf-8")
+        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", sel_student).strip("_")
+        st.download_button(
+            "⬇️ Download Statement CSV",
+            data=csv_bytes,
+            file_name=f"Fee_Statement_{safe_name}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+elif page == "📊 Fee Reports":
+    if st.session_state.user_role not in ["admin", "clerk"]:
+        st.error("🔒 You don't have access to fee pages.")
+        st.stop()
+    st.subheader("📊 Fee Reports")
+    st.caption("Overview of fee collection across the school.")
+
+    streams_available = get_all_streams_from_data()
+
+    # --- Filter by term ---
+    rc1, rc2 = st.columns([1, 2])
+    with rc1:
+        term_filter = st.selectbox(
+            "Report term",
+            ["ALL TERMS"] + TERMS,
+            key="report_term_filter",
+            format_func=lambda x: x.upper() if x != "ALL TERMS" else x
+        )
+    with rc2:
+        stream_filter = st.selectbox(
+            "Filter by stream",
+            ["ALL STREAMS"] + streams_available,
+            key="report_stream_filter"
+        )
+
+    # --- Fetch data ---
+    if term_filter == "ALL TERMS":
+        all_payments = get_fee_payments(include_voided=False)
+    else:
+        all_payments = get_fee_payments(term=term_filter, include_voided=False)
+
+    if stream_filter != "ALL STREAMS":
+        all_payments = [p for p in all_payments if p.get("stream") == stream_filter]
+
+    # --- Summary metrics ---
+    total_collected = sum(float(p["amount"]) for p in all_payments)
+    total_payments = len(all_payments)
+    average_payment = total_collected / total_payments if total_payments else 0
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total Collected", f"KSh {total_collected:,.0f}")
+    c2.metric("Payments Recorded", total_payments)
+    c3.metric("Average Payment", f"KSh {average_payment:,.0f}")
+
+    # --- By method ---
+    st.divider()
+    st.markdown("### 💳 Collection by Payment Method")
+    method_totals = {}
+    method_counts = {}
+    for p in all_payments:
+        m = p.get("payment_method", "unknown")
+        method_totals[m] = method_totals.get(m, 0) + float(p["amount"])
+        method_counts[m] = method_counts.get(m, 0) + 1
+
+    if method_totals:
+        method_rows = []
+        for m, tot in sorted(method_totals.items(), key=lambda x: -x[1]):
+            pct = (tot / total_collected * 100) if total_collected else 0
+            method_rows.append({
+                "Method": m.title(),
+                "Total (KSh)": f"{tot:,.0f}",
+                "Payments": method_counts[m],
+                "% of Total": f"{pct:.1f}%"
+            })
+        st.dataframe(pd.DataFrame(method_rows), use_container_width=True, hide_index=True)
+    else:
+        st.info("No payments yet for this filter.")
+
+    # --- By term ---
+    st.divider()
+    st.markdown("### 📅 Collection by Term")
+    term_totals = {}
+    for t in TERMS:
+        term_totals[t] = 0
+    for p in all_payments:
+        t = (p.get("term") or "").lower()
+        if t in term_totals:
+            term_totals[t] += float(p["amount"])
+
+    term_rows = []
+    for t in TERMS:
+        term_rows.append({
+            "Term": t.upper(),
+            "Collected (KSh)": f"{term_totals[t]:,.0f}"
+        })
+    st.dataframe(pd.DataFrame(term_rows), use_container_width=True, hide_index=True)
+
+    # --- By stream ---
+    if stream_filter == "ALL STREAMS":
+        st.divider()
+        st.markdown("### 🏫 Collection by Stream")
+        stream_totals = {}
+        stream_counts = {}
+        for p in all_payments:
+            s = p.get("stream") or "Unknown"
+            stream_totals[s] = stream_totals.get(s, 0) + float(p["amount"])
+            stream_counts[s] = stream_counts.get(s, 0) + 1
+
+        if stream_totals:
+            stream_rows = []
+            for s, tot in sorted(stream_totals.items(), key=lambda x: -x[1]):
+                stream_rows.append({
+                    "Stream": s,
+                    "Total (KSh)": f"{tot:,.0f}",
+                    "Payments": stream_counts[s]
+                })
+            st.dataframe(pd.DataFrame(stream_rows), use_container_width=True, hide_index=True)
+
+    # --- Outstanding students ---
+    st.divider()
+        # ============================================================
+    # 🚨 FEE DEFAULT REPORT — students below a threshold
+    # ============================================================
+    st.divider()
+    st.markdown("### 🚨 Fee Default Report")
+    st.caption(
+        "Enter a fee threshold. The report lists students who have **paid LESS** than that "
+        "amount. Students who have paid the threshold **or more** are excluded (they stay at school)."
+    )
+
+    with st.expander("⚙️ Configure Fee Default Report", expanded=True):
+        dc1, dc2 = st.columns(2)
+        with dc1:
+            default_term = st.selectbox(
+                "Report for term",
+                ["ALL TERMS"] + TERMS,
+                key="default_term",
+                format_func=lambda x: x.upper() if x != "ALL TERMS" else x
+            )
+            default_stream = st.selectbox(
+                "Stream",
+                ["ALL STREAMS"] + streams_available,
+                key="default_stream"
+            )
+        with dc2:
+            default_threshold = st.number_input(
+                "Fee threshold (KSh)",
+                min_value=0.0,
+                value=340000.0,
+                step=1000.0,
+                key="default_threshold",
+                help="Students who paid LESS than this will be listed."
+            )
+            st.caption("Example: If you set 340,000 — students who paid less than that are listed. Those who paid 340,000 or more are NOT listed.")
+
+        generate_default_btn = st.button(
+            "🔍 Generate Fee Default Report",
+            type="primary",
+            use_container_width=True,
+            key="generate_default_btn"
+        )
+
+    if generate_default_btn:
+        # Build the list
+        defaulters = []
+        if st.session_state.get("data") is not None:
+            sdf = st.session_state.data["df"]
+            sname = st.session_state.data["name_col"]
+            sstream = st.session_state.data["stream_col"]
+
+            for _, row in sdf.iterrows():
+                student_nm = str(row[sname])
+                student_str = str(row[sstream])
+                if default_stream != "ALL STREAMS" and student_str != default_stream:
+                    continue
+
+                if default_term == "ALL TERMS":
+                    structure = get_fee_structure(stream=student_str)
+                    expected = sum(float(s["amount"]) for s in structure)
+                    payments = get_fee_payments(student_name=student_nm, include_voided=False)
+                    paid = sum(float(p["amount"]) for p in payments)
+                else:
+                    structure = get_fee_structure(stream=student_str, term=default_term)
+                    expected = sum(float(s["amount"]) for s in structure)
+                    payments = get_fee_payments(student_name=student_nm, term=default_term)
+                    paid = sum(float(p["amount"]) for p in payments)
+
+                balance = expected - paid
+
+                # Include only if PAID is LESS than threshold
+                if paid < default_threshold:
+                    defaulters.append({
+                        "student": student_nm,
+                        "stream": student_str,
+                        "expected": expected,
+                        "paid": paid,
+                        "balance": balance,
+                    })
+
+        if not defaulters:
+            st.success(f"🎉 No students have paid less than KSh {default_threshold:,.0f}. Everyone is above the threshold!")
+        else:
+            # Sort worst first (lowest paid)
+            defaulters.sort(key=lambda x: x["paid"])
+
+            st.markdown(f"### 📋 {len(defaulters)} student(s) below KSh {default_threshold:,.0f}")
+            st.caption(
+                f"Report term: **{default_term.upper() if default_term != 'ALL TERMS' else 'ALL TERMS'}** "
+                f"• Stream: **{default_stream}**"
+            )
+
+            df_def = pd.DataFrame([
+                {
+                    "#": i,
+                    "Student": d["student"],
+                    "Stream": d["stream"],
+                    "Expected (KSh)": f"{d['expected']:,.0f}",
+                    "Paid (KSh)": f"{d['paid']:,.0f}",
+                    "Balance (KSh)": f"{d['balance']:,.0f}",
+                }
+                for i, d in enumerate(defaulters, 1)
+            ])
+            st.dataframe(df_def, use_container_width=True, hide_index=True)
+
+            # Downloads
+            dl1, dl2 = st.columns(2)
+            with dl1:
+                # CSV
+                csv_rows = [[
+                    "FEE DEFAULT REPORT",
+                    f"Threshold: KSh {default_threshold:,.0f}",
+                    f"Term: {default_term.upper() if default_term != 'ALL TERMS' else 'ALL TERMS'}",
+                    f"Stream: {default_stream}",
+                    f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}",
+                ], [], ["#", "Student", "Stream", "Expected", "Paid", "Balance"]]
+                for i, d in enumerate(defaulters, 1):
+                    csv_rows.append([
+                        i, d["student"], d["stream"],
+                        d["expected"], d["paid"], d["balance"]
+                    ])
+                csv_bytes = pd.DataFrame(csv_rows).to_csv(index=False, header=False).encode("utf-8")
+                st.download_button(
+                    "📥 Download CSV",
+                    data=csv_bytes,
+                    file_name=f"Fee_Default_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="default_dl_csv"
+                )
+            with dl2:
+                if st.button("🖨️ Prepare PDF for Print", type="primary", use_container_width=True, key="default_prepare_pdf"):
+                    pdf = generate_defaulters_pdf(
+                        defaulters,
+                        default_threshold,
+                        default_term.upper() if default_term != "ALL TERMS" else "ALL TERMS",
+                        st.session_state.school_name
+                    )
+                    st.download_button(
+                        "⬇️ Download PDF",
+                        data=pdf.getvalue(),
+                        file_name=f"Fee_Default_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key="default_dl_pdf"
+                    )
+
+    st.markdown("### ⚠️ Students with Outstanding Balances")
+    st.caption("Students who still owe fees (for the selected term).")
+
+    if st.session_state.get("data") is None:
+        st.info("No Excel data loaded.")
+    else:
+        sdf = st.session_state.data["df"]
+        sname = st.session_state.data["name_col"]
+        sstream = st.session_state.data["stream_col"]
+
+        # Only consider the current Excel students
+        outstanding = []
+        for _, row in sdf.iterrows():
+            student_name = str(row[sname])
+            student_stream = str(row[sstream])
+            if stream_filter != "ALL STREAMS" and student_stream != stream_filter:
+                continue
+
+            if term_filter == "ALL TERMS":
+                # Sum expected across all terms for this stream
+                all_structure = get_fee_structure(stream=student_stream)
+                expected_all = sum(float(s["amount"]) for s in all_structure)
+                paid_all = sum(float(p["amount"]) for p in
+                               get_fee_payments(student_name=student_name, include_voided=False))
+                balance = expected_all - paid_all
+                term_label = "ALL"
+            else:
+                structure = get_fee_structure(stream=student_stream, term=term_filter)
+                expected_term = sum(float(s["amount"]) for s in structure)
+                paid_term = sum(float(p["amount"]) for p in
+                                get_fee_payments(student_name=student_name, term=term_filter))
+                balance = expected_term - paid_term
+                term_label = term_filter.upper()
+
+            if balance > 0:
+                outstanding.append({
+                    "Student": student_name,
+                    "Stream": student_stream,
+                    "Term": term_label,
+                    "Balance (KSh)": f"{balance:,.0f}"
+                })
+
+        if outstanding:
+            outstanding.sort(key=lambda x: -float(x["Balance (KSh)"].replace(",", "")))
+            st.dataframe(pd.DataFrame(outstanding), use_container_width=True, hide_index=True)
+            st.caption(f"**{len(outstanding)}** student(s) with outstanding balances.")
+        else:
+            st.success("🎉 No outstanding balances — all students settled!")
+
+    # --- Export report ---
+    st.divider()
+    st.markdown("### 📥 Export Report")
+    st.caption("Download a CSV summary that you can open in Excel.")
+
+    if st.button("📄 Prepare Report CSV", type="primary", key="report_export_btn"):
+        report_rows = []
+        report_rows.append(["FEE COLLECTION REPORT"])
+        report_rows.append(["Term:", term_filter])
+        report_rows.append(["Stream:", stream_filter])
+        report_rows.append(["Generated:", datetime.now().strftime("%Y-%m-%d %H:%M")])
+        report_rows.append([])
+        report_rows.append(["SUMMARY"])
+        report_rows.append(["Total Collected", f"{total_collected:.2f}"])
+        report_rows.append(["Payments Recorded", total_payments])
+        report_rows.append(["Average Payment", f"{average_payment:.2f}"])
+        report_rows.append([])
+        report_rows.append(["BY METHOD"])
+        report_rows.append(["Method", "Total", "Payments"])
+        for m, tot in sorted(method_totals.items(), key=lambda x: -x[1]):
+            report_rows.append([m.title(), f"{tot:.2f}", method_counts[m]])
+        report_rows.append([])
+        report_rows.append(["BY TERM"])
+        report_rows.append(["Term", "Collected"])
+        for t in TERMS:
+            report_rows.append([t.upper(), f"{term_totals[t]:.2f}"])
+        report_rows.append([])
+        report_rows.append(["ALL PAYMENTS"])
+        report_rows.append(["Date", "Student", "Stream", "Term", "Amount", "Method", "Reference", "Recorded By"])
+        for p in all_payments:
+            report_rows.append([
+                p.get("payment_date", ""),
+                p.get("student_name", ""),
+                p.get("stream", ""),
+                (p.get("term") or "").upper(),
+                float(p.get("amount", 0)),
+                p.get("payment_method", ""),
+                p.get("reference", ""),
+                p.get("recorded_by", ""),
+            ])
+
+        csv_df = pd.DataFrame(report_rows)
+        csv_bytes = csv_df.to_csv(index=False, header=False).encode("utf-8")
+        st.download_button(
+            "⬇️ Download Report CSV",
+            data=csv_bytes,
+            file_name=f"Fee_Report_{term_filter}_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+            mime="text/csv",
+            use_container_width=True
+        )
+
 elif page == "Settings":
     st.subheader("School Profile & System Settings")
 
-    tab_profile, tab_password, tab_teachers, tab_parents, tab_students, tab_format, tab_backup = st.tabs([
-    "🏫 School Profile",
-    "🔒 Change Password",
-    "👨‍🏫 Teacher Accounts",
-    "👨‍👩‍👧 Parent Accounts",
-    "🎓 Student Accounts",
-    "📄 Excel Format Guide",
-    "💾 Backup & Data"
-])
+    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_backup = st.tabs([
+        "🏫 School Profile",
+        "🔒 Change Password",
+        "👨‍🏫 Teacher Accounts",
+        "💼 Clerk Accounts",
+        "👨‍👩‍👧 Parent Accounts",
+        "🎓 Student Accounts",
+        "📄 Excel Format Guide",
+        "💾 Backup & Data"
+    ])
         
     with tab_profile:
         left, right = st.columns(2)
@@ -2959,6 +4443,7 @@ elif page == "Settings":
             address = st.text_input("School address", value=st.session_state.school_address)
             phone = st.text_input("School phone", value=st.session_state.school_phone)
             email = st.text_input("School email", value=st.session_state.school_email)
+            motto = st.text_input("School motto", value=st.session_state.get("school_motto", ""), placeholder="e.g. Learn • Grow • Succeed")
         with right:
             academic_year = st.text_input("Academic year", value=st.session_state.academic_year)
             current_term = st.selectbox(
@@ -2994,6 +4479,7 @@ elif page == "Settings":
             st.session_state.school_address = address.strip()
             st.session_state.school_phone = phone.strip()
             st.session_state.school_email = email.strip()
+            st.session_state.school_motto = motto.strip()
             st.session_state.academic_year = academic_year.strip() or "2026"
             st.session_state.current_term = current_term
             st.session_state.class_teacher_name = teacher_name.strip() or "Class Teacher"
@@ -3029,51 +4515,69 @@ elif page == "Settings":
                     change_user_password(st.session_state.username, new_pw)
                     st.success("Password updated.")
 
-    with tab_teachers:
-        st.caption("Create and manage teacher accounts. Each teacher gets their own username and password.")
-        teachers = get_teachers()
-        if teachers:
-            df_teachers = pd.DataFrame(teachers)
-            df_teachers.columns = ["Username", "Full Name"]
-            st.dataframe(df_teachers, use_container_width=True, hide_index=True)
+    with tab_clerks:
+        st.caption("Create clerk accounts for bursars/accountants. Clerks see only fee pages.")
+        try:
+            clerk_rows = supabase.table("users").select("username,student_name").eq("role", "clerk").order("username").execute().data
+            if clerk_rows:
+                df_clerks = pd.DataFrame(clerk_rows)
+                df_clerks.columns = ["Username", "Full Name"]
+                st.dataframe(df_clerks, use_container_width=True, hide_index=True)
+        except Exception:
+            pass
 
-        t1, t2 = st.columns(2)
-        with t1:
-            teacher_username = st.text_input("Teacher username", placeholder="e.g. mr.kamau", key="new_teacher_username")
-            teacher_full_name = st.text_input("Teacher full name", placeholder="e.g. Mr. Peter Kamau", key="new_teacher_full_name")
-        with t2:
-            teacher_password = st.text_input("Teacher password", type="password", key="new_teacher_password")
+        ck1, ck2 = st.columns(2)
+        with ck1:
+            clerk_username = st.text_input("Clerk username", placeholder="e.g. bursar.jane", key="new_clerk_username")
+            clerk_full_name = st.text_input("Clerk full name", placeholder="e.g. Jane Wanjiru (Bursar)", key="new_clerk_full_name")
+        with ck2:
+            clerk_password = st.text_input("Clerk password", type="password", key="new_clerk_password")
             st.caption("Password should be at least 6 characters.")
 
-        tb1, tb2 = st.columns(2)
-        with tb1:
-            if st.button("➕ Create / Update Teacher", type="primary", use_container_width=True, key="create_teacher_btn"):
-                if not teacher_username.strip() or not teacher_full_name.strip() or not teacher_password.strip():
+        cb1, cb2 = st.columns(2)
+        with cb1:
+            if st.button("➕ Create / Update Clerk", type="primary", use_container_width=True, key="create_clerk_btn"):
+                if not clerk_username.strip() or not clerk_full_name.strip() or not clerk_password.strip():
                     st.error("Enter username, full name and password.")
-                elif len(teacher_password) < 6:
+                elif len(clerk_password) < 6:
                     st.error("Password must be at least 6 characters.")
                 else:
                     try:
-                        create_or_update_teacher(teacher_username.strip(), teacher_full_name.strip(), teacher_password)
-                        st.success(f"Teacher '{teacher_username.strip()}' saved. Share the username and password with them.")
+                        hashed = hash_password(clerk_password)
+                        existing = supabase.table("users").select("username").eq("username", clerk_username.strip()).execute()
+                        if existing.data:
+                            supabase.table("users").update({
+                                "password": hashed, "role": "clerk",
+                                "student_name": clerk_full_name.strip()
+                            }).eq("username", clerk_username.strip()).execute()
+                        else:
+                            supabase.table("users").insert({
+                                "username": clerk_username.strip(), "password": hashed,
+                                "role": "clerk", "student_name": clerk_full_name.strip()
+                            }).execute()
+                        st.success(f"✅ Clerk '{clerk_username.strip()}' saved. Share the username and password with them.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error: {e}")
-        with tb2:
-            with st.expander("🗑️ Delete a teacher"):
-                if teachers:
-                    delete_options = [t["username"] for t in teachers]
-                    selected_delete = st.selectbox("Select teacher to delete", delete_options, key="delete_teacher_select")
-                    confirm_del = st.checkbox("I understand this will remove the teacher account.", key="confirm_delete_teacher")
-                    if st.button("Delete Teacher", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_teacher_btn"):
-                        try:
-                            delete_teacher(selected_delete)
-                            st.success(f"Deleted {selected_delete}.")
-                            st.rerun()
-                        except Exception as e:
-                            st.error(f"Error: {e}")
-                else:
-                    st.info("No teachers to delete.")
+        with cb2:
+            with st.expander("🗑️ Delete a clerk"):
+                try:
+                    clerk_list = supabase.table("users").select("username").eq("role", "clerk").order("username").execute().data
+                    if clerk_list:
+                        delete_options = [c["username"] for c in clerk_list]
+                        selected_delete = st.selectbox("Select clerk to delete", delete_options, key="delete_clerk_select")
+                        confirm_del = st.checkbox("I understand this will remove the clerk account.", key="confirm_delete_clerk")
+                        if st.button("Delete Clerk", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_clerk_btn"):
+                            try:
+                                supabase.table("users").delete().eq("username", selected_delete).eq("role", "clerk").execute()
+                                st.success(f"Deleted {selected_delete}.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+                    else:
+                        st.info("No clerks to delete.")
+                except Exception:
+                    st.info("No clerks to delete.")
 
     with tab_parents:
         st.caption("Link a parent account to one or more student names. Use | between multiple children.")
