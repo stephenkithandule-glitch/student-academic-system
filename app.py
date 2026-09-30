@@ -717,6 +717,32 @@ def void_fee_payment(payment_id, username, reason):
     log_fee_action(username, "void_payment", f"id={payment_id} reason={reason}")
 
 
+def get_current_term():
+    """Return the current academic term (like 'y3t1')."""
+    # Try to detect from the academic year + current_term setting
+    year_str = str(st.session_state.get("academic_year", "2026"))
+    term_setting = st.session_state.get("current_term", "Term 3")
+
+    # Extract year number from academic_year: "2026" → 1, "2027" → 2, etc.
+    # Default to year 1
+    try:
+        # Look at the Excel data terms — pick the latest one
+        if st.session_state.get("data") is not None:
+            terms = st.session_state.data["target_terms"]
+            if terms:
+                return terms[-1]  # latest term in the data
+    except Exception:
+        pass
+
+    # Fallback: extract from current_term setting
+    term_num = 1
+    if "Term 2" in term_setting:
+        term_num = 2
+    elif "Term 3" in term_setting:
+        term_num = 3
+
+    # Assume year 1 by default (most common for first-time use)
+    return f"y1t{term_num}"
 def get_allocated_ledger(student_name, stream):
     """
     Return term-by-term breakdown with payments allocated to earliest unpaid terms.
@@ -2214,8 +2240,156 @@ if page == "Parent Portal":
         pass
 
     # ============================================================
-    # 💰 FEE STATUS (Parent view)
+    # 💰 FEE STATUS (Parent view — current term focus)
     # ============================================================
+    st.divider()
+    st.markdown("### 💰 Fee Status")
+    st.caption("Your child's fee balance and payment history.")
+
+    try:
+        _student_name = str(student[name_col])
+        _student_stream = str(student[stream_col])
+        _allocated = get_allocated_ledger(_student_name, _student_stream)
+
+        if _allocated["total_expected"] == 0 and _allocated["total_paid"] == 0:
+            st.info("No fee structure has been set for your child's stream yet. Please contact the school.")
+        else:
+            # ---- CURRENT TERM FOCUS ----
+            current_term = get_current_term()
+
+            # Find the current term's row in the allocated ledger
+            current_row = None
+            for r in _allocated["rows"]:
+                if r["term"] == current_term:
+                    current_row = r
+                    break
+
+            # If current term not found, use the first term with a balance
+            if current_row is None:
+                for r in _allocated["rows"]:
+                    if r["balance"] > 0:
+                        current_row = r
+                        break
+            if current_row is None and _allocated["rows"]:
+                current_row = _allocated["rows"][0]
+
+            if current_row:
+                st.markdown(f"#### 📌 Current Term: {current_row['term'].upper()}")
+                cc1, cc2, cc3 = st.columns(3)
+                cc1.metric("Term Fee", f"KSh {current_row['expected']:,.0f}")
+                cc2.metric("Paid (this term)", f"KSh {current_row['allocated']:,.0f}")
+                bal_current = current_row["balance"]
+                cc3.metric(
+                    "Balance (this term)",
+                    f"KSh {bal_current:,.0f}",
+                    delta=None if bal_current == 0 else ("Settled ✅" if bal_current <= 0 else "Outstanding")
+                )
+
+                if bal_current <= 0 and current_row["expected"] > 0:
+                    st.success("✅ This term's fees are fully paid. Thank you.")
+                elif bal_current > 0:
+                    st.warning(f"⚠️ You have KSh {bal_current:,.0f} outstanding for {current_row['term'].upper()}.")
+            else:
+                st.info("No current term fee structure set. Please contact the school.")
+
+            # ---- FULL YEAR SUMMARY (secondary) ----
+            st.divider()
+            st.markdown("#### 📊 Full Year Summary")
+            st.caption("Overview across all terms (for reference).")
+
+            fs1, fs2, fs3 = st.columns(3)
+            fs1.metric("Total Expected (all terms)", f"KSh {_allocated['total_expected']:,.0f}")
+            fs2.metric("Total Paid", f"KSh {_allocated['total_paid']:,.0f}")
+            total_bal = _allocated["total_balance"]
+            fs3.metric(
+                "Total Outstanding",
+                f"KSh {total_bal:,.0f}",
+                delta=None if total_bal == 0 else ("Credit" if total_bal < 0 else "")
+            )
+
+            if _allocated["credit"] > 0:
+                st.info(f"💰 **Credit balance:** KSh {_allocated['credit']:,.0f} — this will apply to next term's fees.")
+
+            # ---- TERM-BY-TERM BREAKDOWN ----
+            st.divider()
+            st.markdown("#### 📅 Term-by-Term Breakdown")
+            st.caption("Payments are automatically applied to the earliest unpaid term.")
+
+            term_rows = []
+            for r in _allocated["rows"]:
+                is_current = (r["term"] == current_term)
+                term_rows.append({
+                    "Term": r["term"].upper() + (" ⬅ current" if is_current else ""),
+                    "Expected (KSh)": f"{r['expected']:,.0f}",
+                    "Allocated (KSh)": f"{r['allocated']:,.0f}",
+                    "Balance (KSh)": f"{r['balance']:,.0f}",
+                    "Status": r["status"],
+                })
+            st.dataframe(pd.DataFrame(term_rows), use_container_width=True, hide_index=True)
+
+            # ---- PAYMENT HISTORY ----
+            st.divider()
+            st.markdown("#### 📜 Payment History")
+            payments = _allocated.get("rows", [])  # placeholder — we'll fetch from ledger
+            payments = get_fee_payments(student_name=_student_name)
+            if not payments:
+                st.info("No payments recorded yet.")
+            else:
+                pay_rows = []
+                for p in payments:
+                    pay_rows.append({
+                        "Date": p.get("payment_date", ""),
+                        "Term": (p.get("term") or "").upper(),
+                        "Amount (KSh)": f"{float(p.get('amount', 0)):,.0f}",
+                        "Method": p.get("payment_method", ""),
+                        "Reference": p.get("reference", ""),
+                    })
+                st.dataframe(pd.DataFrame(pay_rows), use_container_width=True, hide_index=True)
+
+            # ---- DOWNLOAD STATEMENT ----
+            st.divider()
+            st.markdown("#### 📄 Download Statement")
+            if st.button("📥 Prepare Fee Statement (CSV)", type="primary", key="parent_fee_stmt"):
+                statement_rows = []
+                statement_rows.append(["Student", _student_name])
+                statement_rows.append(["Stream", _student_stream])
+                statement_rows.append([])
+                statement_rows.append(["Term", "Expected", "Allocated", "Balance"])
+                for r in _allocated["rows"]:
+                    statement_rows.append([
+                        r["term"].upper(),
+                        r["expected"],
+                        r["allocated"],
+                        r["balance"]
+                    ])
+                statement_rows.append([])
+                statement_rows.append(["TOTAL EXPECTED", _allocated["total_expected"]])
+                statement_rows.append(["TOTAL PAID", _allocated["total_paid"]])
+                statement_rows.append(["TOTAL BALANCE", _allocated["total_balance"]])
+                statement_rows.append([])
+                statement_rows.append(["Date", "Term", "Amount", "Method", "Reference"])
+                for p in payments:
+                    statement_rows.append([
+                        p.get("payment_date", ""),
+                        (p.get("term") or "").upper(),
+                        float(p.get("amount", 0)),
+                        p.get("payment_method", ""),
+                        p.get("reference", ""),
+                    ])
+
+                csv_df = pd.DataFrame(statement_rows)
+                csv_bytes = csv_df.to_csv(index=False, header=False).encode("utf-8")
+                safe_student = re.sub(r"[^A-Za-z0-9_-]+", "_", _student_name).strip("_")
+                st.download_button(
+                    "⬇️ Download Fee Statement (CSV)",
+                    data=csv_bytes,
+                    file_name=f"Fee_Statement_{safe_student}.csv",
+                    mime="text/csv",
+                    use_container_width=True,
+                    key="parent_fee_dl"
+                )
+    except Exception as e:
+        st.warning(f"Fee information is not available yet: {e}")
     st.divider()
     st.markdown("### 💰 Fee Status")
     st.caption("Your child's fee balance and payment history.")
@@ -4275,7 +4449,8 @@ elif page == "📊 Fee Reports":
     st.markdown("### 🚨 Fee Default Report")
     st.caption(
         "Enter a fee threshold. The report lists students who have **paid LESS** than that "
-        "amount. Students who have paid the threshold **or more** are excluded (they stay at school)."
+        "amount **AND still owe money**. Students who have paid the threshold or more, "
+        "or who have overpaid, are excluded."
     )
 
     with st.expander("⚙️ Configure Fee Default Report", expanded=True):
@@ -4337,8 +4512,9 @@ elif page == "📊 Fee Reports":
 
                 balance = expected - paid
 
-                # Include only if PAID is LESS than threshold
-                if paid < default_threshold:
+                # Include only if PAID is LESS than threshold AND still owes money
+                # Skip students who overpaid (negative balance)
+                if paid < default_threshold and balance > 0:
                     defaulters.append({
                         "student": student_nm,
                         "stream": student_str,
@@ -4372,10 +4548,12 @@ elif page == "📊 Fee Reports":
             ])
             st.dataframe(df_def, use_container_width=True, hide_index=True)
 
-            # Downloads
+            # Downloads — always visible
+            st.markdown("### 📥 Download Report")
             dl1, dl2 = st.columns(2)
+
+            # CSV — always available
             with dl1:
-                # CSV
                 csv_rows = [[
                     "FEE DEFAULT REPORT",
                     f"Threshold: KSh {default_threshold:,.0f}",
@@ -4397,22 +4575,24 @@ elif page == "📊 Fee Reports":
                     use_container_width=True,
                     key="default_dl_csv"
                 )
+
+            # PDF — generate once, cache in session
             with dl2:
-                if st.button("🖨️ Prepare PDF for Print", type="primary", use_container_width=True, key="default_prepare_pdf"):
-                    pdf = generate_defaulters_pdf(
-                        defaulters,
-                        default_threshold,
-                        default_term.upper() if default_term != "ALL TERMS" else "ALL TERMS",
-                        st.session_state.school_name
-                    )
-                    st.download_button(
-                        "⬇️ Download PDF",
-                        data=pdf.getvalue(),
-                        file_name=f"Fee_Default_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
-                        mime="application/pdf",
-                        use_container_width=True,
-                        key="default_dl_pdf"
-                    )
+                # Generate the PDF every time (fast)
+                pdf = generate_defaulters_pdf(
+                    defaulters,
+                    default_threshold,
+                    default_term.upper() if default_term != "ALL TERMS" else "ALL TERMS",
+                    st.session_state.school_name
+                )
+                st.download_button(
+                    "🖨️ Download PDF for Print",
+                    data=pdf.getvalue(),
+                    file_name=f"Fee_Default_Report_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                    mime="application/pdf",
+                    use_container_width=True,
+                    key="default_dl_pdf"
+                )
 
     st.markdown("### ⚠️ Students with Outstanding Balances")
     st.caption("Students who still owe fees (for the selected term).")
@@ -4606,6 +4786,52 @@ elif page == "Settings":
                 else:
                     change_user_password(st.session_state.username, new_pw)
                     st.success("Password updated.")
+
+        with tab_teachers:
+            st.caption("Create and manage teacher accounts. Each teacher gets their own username and password.")
+    teachers = get_teachers()
+    if teachers:
+        df_teachers = pd.DataFrame(teachers)
+        df_teachers.columns = ["Username", "Full Name"]
+        st.dataframe(df_teachers, use_container_width=True, hide_index=True)
+
+    t1, t2 = st.columns(2)
+    with t1:
+        teacher_username = st.text_input("Teacher username", placeholder="e.g. mr.kamau", key="new_teacher_username")
+        teacher_full_name = st.text_input("Teacher full name", placeholder="e.g. Mr. Peter Kamau", key="new_teacher_full_name")
+    with t2:
+        teacher_password = st.text_input("Teacher password", type="password", key="new_teacher_password")
+        st.caption("Password should be at least 6 characters.")
+
+    tb1, tb2 = st.columns(2)
+    with tb1:
+        if st.button("➕ Create / Update Teacher", type="primary", use_container_width=True, key="create_teacher_btn"):
+            if not teacher_username.strip() or not teacher_full_name.strip() or not teacher_password.strip():
+                st.error("Enter username, full name and password.")
+            elif len(teacher_password) < 6:
+                st.error("Password must be at least 6 characters.")
+            else:
+                try:
+                    create_or_update_teacher(teacher_username.strip(), teacher_full_name.strip(), teacher_password)
+                    st.success(f"Teacher '{teacher_username.strip()}' saved. Share the username and password with them.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Error: {e}")
+    with tb2:
+        with st.expander("🗑️ Delete a teacher"):
+            if teachers:
+                delete_options = [t["username"] for t in teachers]
+                selected_delete = st.selectbox("Select teacher to delete", delete_options, key="delete_teacher_select")
+                confirm_del = st.checkbox("I understand this will remove the teacher account.", key="confirm_delete_teacher")
+                if st.button("Delete Teacher", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_teacher_btn"):
+                    try:
+                        delete_teacher(selected_delete)
+                        st.success(f"Deleted {selected_delete}.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+            else:
+                st.info("No teachers to delete.")
 
     with tab_clerks:
         st.caption("Create clerk accounts for bursars/accountants. Clerks see only fee pages.")
