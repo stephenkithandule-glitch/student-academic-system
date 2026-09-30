@@ -1164,23 +1164,41 @@ def generate_receipt_pdf(payment_row, school_name, balance_before, balance_after
         story.append(Spacer(1, 8))
 
     # ==========================================================
-    # Received by
+    # Received by with clerk signature
     # ==========================================================
     recv_by = str(payment_row.get("recorded_by", ""))
-    received = Table([
-        [Paragraph("Received by:", header_style), Paragraph(recv_by, info_style)],
-        [Paragraph("Date:", header_style), Paragraph(pay_date, info_style)],
-    ], colWidths=[80, 300])
-    received.setStyle(TableStyle([
-        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ("LEFTPADDING", (0, 0), (-1, -1), 0),
-        ("TOPPADDING", (0, 0), (-1, -1), 2),
-        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-    ]))
-    story.append(received)
-    story.append(Spacer(1, 14))
-    story.append(Paragraph("_____________________________", info_style))
-    story.append(Paragraph("Authorized Signature & School Stamp", styles["meta"]))
+    recv_by_name = recv_by  # default to username
+
+    # Try to fetch clerk's full name and signature
+    clerk_sig_b64 = None
+    try:
+        clerk_result = supabase.table("users").select("student_name,signature_base64").eq("username", recv_by).execute()
+        if clerk_result.data:
+            row = clerk_result.data[0]
+            if row.get("student_name"):
+                recv_by_name = row["student_name"]
+            if row.get("signature_base64"):
+                clerk_sig_b64 = row["signature_base64"]
+    except Exception:
+        pass
+
+    story.append(Paragraph("Received by:", header_style))
+    story.append(Paragraph(recv_by_name, info_style))
+
+    # If clerk has a signature image, show it
+    if clerk_sig_b64:
+        try:
+            sig_bytes = base64.b64decode(clerk_sig_b64)
+            sig_img = Image(io.BytesIO(sig_bytes), width=1.5*inch, height=0.55*inch)
+            story.append(Spacer(1, 4))
+            story.append(sig_img)
+        except Exception:
+            story.append(Paragraph("_____________________________", info_style))
+    else:
+        story.append(Spacer(1, 14))
+        story.append(Paragraph("_____________________________", info_style))
+
+    story.append(Paragraph(f"Date: {pay_date}", info_style))
     story.append(Spacer(1, 8))
     story.append(HRFlowable(width="100%", thickness=0.4, color=colors.HexColor("#999999")))
     story.append(Paragraph(
@@ -4852,6 +4870,14 @@ elif page == "Settings":
             clerk_password = st.text_input("Clerk password", type="password", key="new_clerk_password")
             st.caption("Password should be at least 6 characters.")
 
+        clerk_signature = st.file_uploader(
+            "Clerk signature (PNG/JPG, optional)",
+            type=["png", "jpg", "jpeg"],
+            key="new_clerk_signature"
+        )
+        if clerk_signature is not None:
+            st.image(clerk_signature, width=180, caption="Signature preview")
+
         cb1, cb2 = st.columns(2)
         with cb1:
             if st.button("➕ Create / Update Clerk", type="primary", use_container_width=True, key="create_clerk_btn"):
@@ -4862,17 +4888,28 @@ elif page == "Settings":
                 else:
                     try:
                         hashed = hash_password(clerk_password)
+                        # Prepare signature if uploaded
+                        sig_b64 = None
+                        if clerk_signature is not None:
+                            sig_b64 = base64.b64encode(clerk_signature.getvalue()).decode("utf-8")
+
                         existing = supabase.table("users").select("username").eq("username", clerk_username.strip()).execute()
                         if existing.data:
-                            supabase.table("users").update({
+                            update_payload = {
                                 "password": hashed, "role": "clerk",
                                 "student_name": clerk_full_name.strip()
-                            }).eq("username", clerk_username.strip()).execute()
+                            }
+                            if sig_b64 is not None:
+                                update_payload["signature_base64"] = sig_b64
+                            supabase.table("users").update(update_payload).eq("username", clerk_username.strip()).execute()
                         else:
-                            supabase.table("users").insert({
+                            insert_payload = {
                                 "username": clerk_username.strip(), "password": hashed,
                                 "role": "clerk", "student_name": clerk_full_name.strip()
-                            }).execute()
+                            }
+                            if sig_b64 is not None:
+                                insert_payload["signature_base64"] = sig_b64
+                            supabase.table("users").insert(insert_payload).execute()
                         st.success(f"✅ Clerk '{clerk_username.strip()}' saved. Share the username and password with them.")
                         st.rerun()
                     except Exception as e:
