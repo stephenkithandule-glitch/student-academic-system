@@ -58,10 +58,18 @@ label, .stMarkdown, .stText, p {
 .app-subtitle {color:#6b7280; margin-top:2px; margin-bottom:18px;}
 .section-title {font-size:1.15rem; font-weight:700; margin-top:12px;}
 div[data-testid="stMetric"] {
-    border: 1px solid #e5e7eb;
+    border: 1px solid rgba(128,128,128,0.35);
     border-radius: 12px;
     padding: 10px 14px;
-    background: #ffffff;
+    background: rgba(128,128,128,0.08);
+}
+div[data-testid="stMetric"] * {
+    color: inherit !important;
+}
+div[data-testid="stMetricLabel"],
+div[data-testid="stMetricValue"],
+div[data-testid="stMetricDelta"] {
+    color: inherit !important;
 }
 .school-banner {
     border-radius: 16px;
