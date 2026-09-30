@@ -717,6 +717,92 @@ def void_fee_payment(payment_id, username, reason):
     log_fee_action(username, "void_payment", f"id={payment_id} reason={reason}")
 
 
+def get_allocated_ledger(student_name, stream):
+    """
+    Return term-by-term breakdown with payments allocated to earliest unpaid terms.
+    This is a DISPLAY-ONLY function — it doesn't modify any data.
+    
+    Example:
+    - Expected: Y1T1=50k, Y1T2=50k, Y1T3=50k
+    - Paid: 80k (recorded under any term)
+    - Allocated: Y1T1=50k, Y1T2=30k, Y1T3=0
+    - Balance: Y1T1=0, Y1T2=20k, Y1T3=50k
+    """
+    
+
+    # Get all terms with expected amounts
+    all_structure = get_fee_structure(stream=stream)
+    expected_by_term = {}
+    for s in all_structure:
+        t = (s.get("term") or "").lower()
+        expected_by_term[t] = expected_by_term.get(t, 0) + float(s["amount"])
+
+    # Get all payments (all terms combined)
+    all_payments = get_fee_payments(student_name=student_name, include_voided=False)
+    total_paid = sum(float(p["amount"]) for p in all_payments)
+
+    # Sort terms chronologically (y1t1 < y1t2 < y1t3 < y2t1 < ...)
+    def term_sort_key(t):
+        m = re.match(r"y(\d+)t(\d+)", t)
+        if m:
+            return (int(m.group(1)), int(m.group(2)))
+        return (99, 99)
+
+    sorted_terms = sorted(expected_by_term.keys(), key=term_sort_key)
+
+    # Allocate payments to earliest unpaid terms
+    remaining = total_paid
+    allocated_by_term = {}
+    for term in sorted_terms:
+        expected = expected_by_term[term]
+        if remaining <= 0:
+            allocated_by_term[term] = 0.0
+        elif remaining >= expected:
+            allocated_by_term[term] = expected
+            remaining -= expected
+        else:
+            allocated_by_term[term] = remaining
+            remaining = 0
+
+    # Any remaining is a credit (over-payment beyond all terms)
+    credit = remaining
+
+    # Build result rows
+    rows = []
+    total_expected = 0
+    total_allocated = 0
+    for term in sorted_terms:
+        expected = expected_by_term[term]
+        allocated = allocated_by_term[term]
+        balance = expected - allocated
+        total_expected += expected
+        total_allocated += allocated
+
+        if expected == 0:
+            status = "—"
+        elif balance <= 0:
+            status = "✅ Settled"
+        elif allocated > 0:
+            status = "⚠️ Partial"
+        else:
+            status = "❌ Not paid"
+
+        rows.append({
+            "term": term,
+            "expected": expected,
+            "allocated": allocated,
+            "balance": balance,
+            "status": status,
+        })
+
+    return {
+        "rows": rows,
+        "total_expected": total_expected,
+        "total_paid": total_paid,
+        "total_allocated": total_allocated,
+        "total_balance": total_expected - total_paid,
+        "credit": credit,
+    }
 def get_student_fee_ledger(student_name, stream, term=None):
     """Return expected fees, paid fees, and balance for a student."""
     # Expected: fee structure for their stream
@@ -2151,23 +2237,22 @@ if page == "Parent Portal":
             )
 
             st.markdown("### 📅 Term-by-Term Breakdown")
+            st.caption("Payments are automatically applied to the earliest unpaid term.")
+
+            _allocated = get_allocated_ledger(str(student[name_col]), str(student[stream_col]))
             term_rows = []
-            for term in TERMS:
-                structure = get_fee_structure(stream=str(student[stream_col]), term=term)
-                expected_term = sum(float(s["amount"]) for s in structure)
-                payments_term = get_fee_payments(student_name=str(student[name_col]), term=term)
-                paid_term = sum(float(p["amount"]) for p in payments_term)
-                balance_term = expected_term - paid_term
+            for r in _allocated["rows"]:
                 term_rows.append({
-                    "Term": term.upper(),
-                    "Expected (KSh)": f"{expected_term:,.0f}",
-                    "Paid (KSh)": f"{paid_term:,.0f}",
-                    "Balance (KSh)": f"{balance_term:,.0f}",
-                    "Status": "✅ Settled" if balance_term <= 0 and expected_term > 0
-                              else ("⚠️ Partial" if paid_term > 0 and balance_term > 0
-                                    else ("❌ Not paid" if expected_term > 0 else "—"))
+                    "Term": r["term"].upper(),
+                    "Expected (KSh)": f"{r['expected']:,.0f}",
+                    "Allocated (KSh)": f"{r['allocated']:,.0f}",
+                    "Balance (KSh)": f"{r['balance']:,.0f}",
+                    "Status": r["status"],
                 })
             st.dataframe(pd.DataFrame(term_rows), use_container_width=True, hide_index=True)
+
+            if _allocated["credit"] > 0:
+                st.info(f"💰 **Credit balance:** KSh {_allocated['credit']:,.0f} — this will apply to next term's fees.")
 
             st.markdown("### 📜 Payment History")
             payments = ledger.get("payments", [])
@@ -3820,28 +3905,27 @@ elif page == "📒 Student Ledger":
         delta=None if balance == 0 else ("Settled ✅" if balance <= 0 else "Owes")
     )
 
-    # --- Term-by-term breakdown ---
+    # --- Term-by-term breakdown (with allocation) ---
     st.divider()
     st.markdown("### 📅 Term-by-Term Breakdown")
+    st.caption("Payments are automatically applied to the earliest unpaid term.")
+
+    allocated = get_allocated_ledger(sel_student, sel_stream)
 
     term_rows = []
-    for term in TERMS:
-        structure = get_fee_structure(stream=sel_stream, term=term)
-        expected_term = sum(float(s["amount"]) for s in structure)
-        payments_term = get_fee_payments(student_name=sel_student, term=term)
-        paid_term = sum(float(p["amount"]) for p in payments_term)
-        balance_term = expected_term - paid_term
+    for r in allocated["rows"]:
         term_rows.append({
-            "Term": term.upper(),
-            "Expected (KSh)": f"{expected_term:,.0f}",
-            "Paid (KSh)": f"{paid_term:,.0f}",
-            "Balance (KSh)": f"{balance_term:,.0f}",
-            "Status": "✅ Settled" if balance_term <= 0 and expected_term > 0 else
-                      ("⚠️ Partial" if paid_term > 0 and balance_term > 0 else
-                       ("❌ Not paid" if expected_term > 0 else "—"))
+            "Term": r["term"].upper(),
+            "Expected (KSh)": f"{r['expected']:,.0f}",
+            "Allocated (KSh)": f"{r['allocated']:,.0f}",
+            "Balance (KSh)": f"{r['balance']:,.0f}",
+            "Status": r["status"],
         })
 
     st.dataframe(pd.DataFrame(term_rows), use_container_width=True, hide_index=True)
+
+    if allocated["credit"] > 0:
+        st.info(f"💰 **Credit balance:** KSh {allocated['credit']:,.0f} (over-payment beyond all terms)")
 
     # --- Payment history ---
     st.divider()
