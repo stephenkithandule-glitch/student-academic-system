@@ -4461,7 +4461,7 @@ elif page == "📊 Fee Reports":
     # --- Outstanding students ---
     st.divider()
         # ============================================================
-    # 🚨 FEE DEFAULT REPORT — students below a threshold
+# 🚨 FEE DEFAULT REPORT — students below a threshold
     # ============================================================
     st.divider()
     st.markdown("### 🚨 Fee Default Report")
@@ -4725,8 +4725,15 @@ elif page == "Settings":
         "📄 Excel Format Guide",
         "💾 Backup & Data"
     ])
-        
+
+    # ============================================================
+    # TAB 1: School Profile
+    # ============================================================
     with tab_profile:
+        if st.session_state.user_role != "admin":
+            st.error("🔒 Only administrators can access School Profile settings.")
+            st.stop()
+
         left, right = st.columns(2)
         with left:
             new_name = st.text_input("School name", value=st.session_state.school_name)
@@ -4784,6 +4791,9 @@ elif page == "Settings":
             save_school_settings()
             st.success("✅ Saved to cloud. These settings will persist across restarts.")
 
+    # ============================================================
+    # TAB 2: Change Password
+    # ============================================================
     with tab_password:
         st.write("### Change your password")
         st.caption(f"Signed in as: **{st.session_state.username}** ({st.session_state.user_role})")
@@ -4805,53 +4815,65 @@ elif page == "Settings":
                     change_user_password(st.session_state.username, new_pw)
                     st.success("Password updated.")
 
-        with tab_teachers:
-            st.caption("Create and manage teacher accounts. Each teacher gets their own username and password.")
-    teachers = get_teachers()
-    if teachers:
-        df_teachers = pd.DataFrame(teachers)
-        df_teachers.columns = ["Username", "Full Name"]
-        st.dataframe(df_teachers, use_container_width=True, hide_index=True)
+    # ============================================================
+    # TAB 3: Teacher Accounts
+    # ============================================================
+    with tab_teachers:
+        if st.session_state.user_role != "admin":
+            st.error("🔒 Only administrators can manage teacher accounts.")
+            st.stop()
+        st.caption("Create and manage teacher accounts. Each teacher gets their own username and password.")
+        teachers = get_teachers()
+        if teachers:
+            df_teachers = pd.DataFrame(teachers)
+            df_teachers.columns = ["Username", "Full Name"]
+            st.dataframe(df_teachers, use_container_width=True, hide_index=True)
 
-    t1, t2 = st.columns(2)
-    with t1:
-        teacher_username = st.text_input("Teacher username", placeholder="e.g. mr.kamau", key="new_teacher_username")
-        teacher_full_name = st.text_input("Teacher full name", placeholder="e.g. Mr. Peter Kamau", key="new_teacher_full_name")
-    with t2:
-        teacher_password = st.text_input("Teacher password", type="password", key="new_teacher_password")
-        st.caption("Password should be at least 6 characters.")
+        t1, t2 = st.columns(2)
+        with t1:
+            teacher_username = st.text_input("Teacher username", placeholder="e.g. mr.kamau", key="new_teacher_username")
+            teacher_full_name = st.text_input("Teacher full name", placeholder="e.g. Mr. Peter Kamau", key="new_teacher_full_name")
+        with t2:
+            teacher_password = st.text_input("Teacher password", type="password", key="new_teacher_password")
+            st.caption("Password should be at least 6 characters.")
 
-    tb1, tb2 = st.columns(2)
-    with tb1:
-        if st.button("➕ Create / Update Teacher", type="primary", use_container_width=True, key="create_teacher_btn"):
-            if not teacher_username.strip() or not teacher_full_name.strip() or not teacher_password.strip():
-                st.error("Enter username, full name and password.")
-            elif len(teacher_password) < 6:
-                st.error("Password must be at least 6 characters.")
-            else:
-                try:
-                    create_or_update_teacher(teacher_username.strip(), teacher_full_name.strip(), teacher_password)
-                    st.success(f"Teacher '{teacher_username.strip()}' saved. Share the username and password with them.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
-    with tb2:
-        with st.expander("🗑️ Delete a teacher"):
-            if teachers:
-                delete_options = [t["username"] for t in teachers]
-                selected_delete = st.selectbox("Select teacher to delete", delete_options, key="delete_teacher_select")
-                confirm_del = st.checkbox("I understand this will remove the teacher account.", key="confirm_delete_teacher")
-                if st.button("Delete Teacher", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_teacher_btn"):
+        tb1, tb2 = st.columns(2)
+        with tb1:
+            if st.button("➕ Create / Update Teacher", type="primary", use_container_width=True, key="create_teacher_btn"):
+                if not teacher_username.strip() or not teacher_full_name.strip() or not teacher_password.strip():
+                    st.error("Enter username, full name and password.")
+                elif len(teacher_password) < 6:
+                    st.error("Password must be at least 6 characters.")
+                else:
                     try:
-                        delete_teacher(selected_delete)
-                        st.success(f"Deleted {selected_delete}.")
+                        create_or_update_teacher(teacher_username.strip(), teacher_full_name.strip(), teacher_password)
+                        st.success(f"Teacher '{teacher_username.strip()}' saved. Share the username and password with them.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Error: {e}")
-            else:
-                st.info("No teachers to delete.")
+        with tb2:
+            with st.expander("🗑️ Delete a teacher"):
+                if teachers:
+                    delete_options = [t["username"] for t in teachers]
+                    selected_delete = st.selectbox("Select teacher to delete", delete_options, key="delete_teacher_select")
+                    confirm_del = st.checkbox("I understand this will remove the teacher account.", key="confirm_delete_teacher")
+                    if st.button("Delete Teacher", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_teacher_btn"):
+                        try:
+                            delete_teacher(selected_delete)
+                            st.success(f"Deleted {selected_delete}.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+                else:
+                    st.info("No teachers to delete.")
 
+    # ============================================================
+    # TAB 4: Clerk Accounts
+    # ============================================================
     with tab_clerks:
+        if st.session_state.user_role != "admin":
+            st.error("🔒 Only administrators can manage clerk accounts.")
+            st.stop()
         st.caption("Create clerk accounts for bursars/accountants. Clerks see only fee pages.")
         try:
             clerk_rows = supabase.table("users").select("username,student_name").eq("role", "clerk").order("username").execute().data
@@ -4888,7 +4910,6 @@ elif page == "Settings":
                 else:
                     try:
                         hashed = hash_password(clerk_password)
-                        # Prepare signature if uploaded
                         sig_b64 = None
                         if clerk_signature is not None:
                             sig_b64 = base64.b64encode(clerk_signature.getvalue()).decode("utf-8")
@@ -4934,7 +4955,13 @@ elif page == "Settings":
                 except Exception:
                     st.info("No clerks to delete.")
 
+    # ============================================================
+    # TAB 5: Parent Accounts
+    # ============================================================
     with tab_parents:
+        if st.session_state.user_role != "admin":
+            st.error("🔒 Only administrators can manage parent accounts.")
+            st.stop()
         st.caption("Link a parent account to one or more student names. Use | between multiple children.")
         try:
             parent_rows = supabase.table("parents").select("username,parent_name,child_names").order("username").execute().data
@@ -4962,7 +4989,13 @@ elif page == "Settings":
                 except Exception as e:
                     st.error(f"Error: {e}")
 
+    # ============================================================
+    # TAB 6: Student Accounts
+    # ============================================================
     with tab_students:
+        if st.session_state.user_role != "admin":
+            st.error("🔒 Only administrators can manage student accounts.")
+            st.stop()
         st.caption("Link a student account to one student name so the student can view their own results.")
         try:
             student_rows = supabase.table("students").select("username,student_full_name").order("username").execute().data
@@ -4989,6 +5022,9 @@ elif page == "Settings":
                 except Exception as e:
                     st.error(f"Error: {e}")
 
+    # ============================================================
+    # TAB 7: Excel Format Guide
+    # ============================================================
     with tab_format:
         st.subheader("📄 Excel Format Guide")
         st.caption("The exact columns your student_results.xlsx must contain for the app to read it correctly.")
@@ -5079,6 +5115,9 @@ For **every term**, the app expects 3 types of columns:
                 use_container_width=True
             )
 
+    # ============================================================
+    # TAB 8: Backup & Data
+    # ============================================================
     with tab_backup:
         st.write("### Download a full backup")
         st.caption("ZIP with all cloud tables as JSON files.")
