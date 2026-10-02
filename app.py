@@ -4503,7 +4503,7 @@ elif page == "📊 Fee Reports":
 elif page == "Settings":
     st.subheader("School Profile & System Settings")
 
-    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_backup = st.tabs([
+    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_exams, tab_backup = st.tabs([
         "🏫 School Profile",
         "🔒 Change Password",
         "👨‍🏫 Teacher Accounts",
@@ -4511,6 +4511,7 @@ elif page == "Settings":
         "👨‍👩‍👧 Parent Accounts",
         "🎓 Student Accounts",
         "📄 Excel Format Guide",
+        "🎓 Exams Officer Accounts",
         "💾 Backup & Data"
     ])
 
@@ -4932,6 +4933,76 @@ For **every term**, the app expects 3 types of columns:
 
     # ============================================================
         # ============================================================
+        # ============================================================
+    # TAB 8: Exams Officer Accounts
+    # ============================================================
+    with tab_exams:
+        if st.session_state.user_role not in ["admin"]:
+            st.info("🔒 Only administrators can manage exams officer accounts.")
+        else:
+            st.caption("Create and manage examination officer accounts. Admin can reset passwords here.")
+            try:
+                exams_rows = supabase.table("users").select("username,student_name").eq("role", "exams").order("username").execute().data
+                if exams_rows:
+                    df_exams = pd.DataFrame(exams_rows)
+                    df_exams.columns = ["Username", "Full Name"]
+                    st.dataframe(df_exams, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
+            ex1, ex2 = st.columns(2)
+            with ex1:
+                exams_username = st.text_input("Exams Officer username", placeholder="e.g. exams", key="new_exams_username")
+                exams_full_name = st.text_input("Exams Officer full name", placeholder="e.g. Examination Officer", key="new_exams_full_name")
+            with ex2:
+                exams_password = st.text_input("Exams Officer password", type="password", key="new_exams_password")
+                st.caption("Password should be at least 6 characters.")
+
+            eb1, eb2 = st.columns(2)
+            with eb1:
+                if st.button("➕ Create / Update Exams Officer", type="primary", use_container_width=True, key="create_exams_btn"):
+                    if not exams_username.strip() or not exams_full_name.strip() or not exams_password.strip():
+                        st.error("Enter username, full name and password.")
+                    elif len(exams_password) < 6:
+                        st.error("Password must be at least 6 characters.")
+                    else:
+                        try:
+                            hashed = hash_password(exams_password)
+                            existing = supabase.table("users").select("username").eq("username", exams_username.strip()).execute()
+                            if existing.data:
+                                supabase.table("users").update({
+                                    "password": hashed, "role": "exams",
+                                    "student_name": exams_full_name.strip()
+                                }).eq("username", exams_username.strip()).execute()
+                            else:
+                                supabase.table("users").insert({
+                                    "username": exams_username.strip(), "password": hashed,
+                                    "role": "exams", "student_name": exams_full_name.strip()
+                                }).execute()
+                            st.success(f"✅ Exams Officer '{exams_username.strip()}' saved. Password updated.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+            with eb2:
+                with st.expander("🗑️ Delete an exams officer"):
+                    try:
+                        exams_list = supabase.table("users").select("username").eq("role", "exams").order("username").execute().data
+                        if exams_list:
+                            delete_options = [c["username"] for c in exams_list]
+                            selected_delete = st.selectbox("Select exams officer to delete", delete_options, key="delete_exams_select")
+                            confirm_del = st.checkbox("I understand this will remove the exams officer account.", key="confirm_delete_exams")
+                            if st.button("Delete Exams Officer", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_exams_btn"):
+                                try:
+                                    supabase.table("users").delete().eq("username", selected_delete).eq("role", "exams").execute()
+                                    st.success(f"Deleted {selected_delete}.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                        else:
+                            st.info("No exams officers to delete.")
+                    except Exception:
+                        st.info("No exams officers to delete.")
+
     # TAB 8: Backup & Data
     # ============================================================
     with tab_backup:
