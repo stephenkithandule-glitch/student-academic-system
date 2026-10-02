@@ -1907,6 +1907,26 @@ def generate_all_student_pdfs(data, school_name):
 
 
 # ============================================================
+def create_backup_zip():
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        tables = [
+            "users", "students", "parents",
+            "materials", "submissions",
+            "quizzes", "quiz_questions", "quiz_attempts",
+            "results_store", "school_settings",
+            "fee_structure", "fee_payments", "fee_audit_log",
+        ]
+        for table in tables:
+            try:
+                rows = supabase.table(table).select("*").execute().data or []
+                z.writestr(f"{table}.json", json.dumps(rows, default=str, indent=2))
+            except Exception as e:
+                z.writestr(f"{table}_ERROR.txt", str(e))
+    buf.seek(0)
+    return buf
+
+
 # SESSION STATE
 # ============================================================
 
@@ -1958,7 +1978,7 @@ def login_screen():
 
     left, center, right = st.columns([1, 1.4, 1])
     with center:
-        role = st.selectbox("Login as", ["Administrator", "Teacher", "Student", "Parent", "Clerk"])
+        role = st.selectbox("Login as", ["Administrator", "Teacher", "Student", "Parent", "Clerk", "Exams Officer"])
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
 
@@ -1971,6 +1991,7 @@ def login_screen():
                     or (role == "Student" and user["role"] == "student")
                     or (role == "Parent" and user["role"] == "parent")
                     or (role == "Clerk" and user["role"] == "clerk")
+                    or (role == "Exams Officer" and user["role"] == "exams")
                 )
                 if not valid_role:
                     user = None
@@ -2003,10 +2024,10 @@ st.session_state.school_name = st.sidebar.text_input(
 )
 st.sidebar.caption("School branding can be completed in Settings.")
 
-if st.session_state.user_role in ["admin", "teacher"]:
+if st.session_state.user_role in ["admin", "exams"]:
     uploaded = st.sidebar.file_uploader(
         "Upload student Excel file", type=["xlsx", "xls"]
-    )
+    )    
 else:
     uploaded = None
 
@@ -2107,12 +2128,14 @@ st.markdown(
 
 if st.session_state.user_role == "clerk":
     nav_items = ["💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Change Password"]
+elif st.session_state.user_role == "exams":
+    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "Settings"]
 elif st.session_state.user_role == "student":
     nav_items = ["My Dashboard", "Learning Centre", "Online Tests & Quizzes", "My Profile", "Change Password"]
 elif st.session_state.user_role == "parent":
     nav_items = ["Parent Portal", "Change Password"]
 elif st.session_state.user_role == "teacher":
-    nav_items = ["Dashboard", "Students", "Academic Results", "Streams", "Master Merit List", "Reports", "Learning Centre", "Online Tests & Quizzes", "💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Settings"]
+    nav_items = ["Dashboard", "Students", "Academic Results", "Streams", "Master Merit List", "Reports", "Learning Centre", "Online Tests & Quizzes", "Settings"]
 else:
     nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Settings"]
 
@@ -4114,148 +4137,7 @@ elif page == "📒 Student Ledger":
             use_container_width=True
         )
 
-elif page == "📒 Student Ledger":
-    st.subheader("📒 Student Fee Ledger")
-    st.caption("View a student's complete fee history — expected, paid, and balance.")
 
-    streams_available = get_all_streams_from_data()
-
-    if not streams_available:
-        st.warning("No student data loaded. Upload your Excel file first.")
-        st.stop()
-
-    sc1, sc2 = st.columns([2, 1])
-    with sc1:
-        search_name = st.text_input("🔎 Search student name", placeholder="Type part of a name", key="ledger_search")
-    with sc2:
-        ledger_stream_filter = st.selectbox(
-            "Filter by stream",
-            ["ALL STREAMS"] + streams_available,
-            key="ledger_stream_filter"
-        )
-
-    student_options = []
-    if st.session_state.get("data") is not None:
-        sdf = st.session_state.data["df"]
-        sname = st.session_state.data["name_col"]
-        sstream = st.session_state.data["stream_col"]
-        for _, row in sdf.iterrows():
-            n = str(row[sname])
-            s = str(row[sstream])
-            if ledger_stream_filter != "ALL STREAMS" and s != ledger_stream_filter:
-                continue
-            if search_name and search_name.lower() not in n.lower():
-                continue
-            student_options.append((n, s))
-
-    if not student_options:
-        st.info("No students match the search.")
-        st.stop()
-
-    student_labels = [f"{n} — {s}" for n, s in student_options]
-    selected_label = st.selectbox("Select student", student_labels, key="ledger_student_select")
-    selected_idx = student_labels.index(selected_label)
-    sel_student, sel_stream = student_options[selected_idx]
-
-    st.markdown(f"### 👤 {sel_student}")
-    st.caption(f"Stream: **{sel_stream}**")
-
-    ledger = get_student_fee_ledger(sel_student, sel_stream)
-
-    st.divider()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Total Expected", f"KSh {ledger['expected']:,.0f}")
-    c2.metric("Total Paid", f"KSh {ledger['paid']:,.0f}")
-    balance = ledger["balance"]
-    c3.metric(
-        "Balance",
-        f"KSh {balance:,.0f}",
-        delta=None if balance == 0 else ("Settled ✅" if balance <= 0 else "Owes")
-    )
-
-    st.divider()
-    st.markdown("### 📅 Term-by-Term Breakdown")
-
-    term_rows = []
-    for term in TERMS:
-        structure = get_fee_structure(stream=sel_stream, term=term)
-        expected_term = sum(float(s["amount"]) for s in structure)
-        payments_term = get_fee_payments(student_name=sel_student, term=term)
-        paid_term = sum(float(p["amount"]) for p in payments_term)
-        balance_term = expected_term - paid_term
-        term_rows.append({
-            "Term": term.upper(),
-            "Expected (KSh)": f"{expected_term:,.0f}",
-            "Paid (KSh)": f"{paid_term:,.0f}",
-            "Balance (KSh)": f"{balance_term:,.0f}",
-            "Status": "✅ Settled" if balance_term <= 0 and expected_term > 0 else
-                      ("⚠️ Partial" if paid_term > 0 and balance_term > 0 else
-                       ("❌ Not paid" if expected_term > 0 else "—"))
-        })
-
-    st.dataframe(pd.DataFrame(term_rows), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.markdown("### 📜 Payment History")
-
-    payments = get_fee_payments(student_name=sel_student)
-    if not payments:
-        st.info("No payments recorded yet for this student.")
-    else:
-        pay_rows = []
-        for p in payments:
-            pay_rows.append({
-                "Date": p.get("payment_date", ""),
-                "Term": (p.get("term") or "").upper(),
-                "Amount (KSh)": f"{float(p.get('amount', 0)):,.0f}",
-                "Method": p.get("payment_method", ""),
-                "Reference": p.get("reference", ""),
-                "Recorded By": p.get("recorded_by", ""),
-                "Notes": p.get("notes", ""),
-            })
-        st.dataframe(pd.DataFrame(pay_rows), use_container_width=True, hide_index=True)
-
-    st.divider()
-    st.markdown("### 📄 Download Fee Statement")
-    st.caption("Download a simple statement as CSV — you can open it in Excel and print for the parent.")
-
-    if st.button("📥 Prepare Statement (CSV)", type="primary", key="ledger_download_btn"):
-        statement_rows = []
-        statement_rows.append(["Student", sel_student])
-        statement_rows.append(["Stream", sel_stream])
-        statement_rows.append([])
-        statement_rows.append(["Term", "Expected", "Paid", "Balance"])
-        for term in TERMS:
-            structure = get_fee_structure(stream=sel_stream, term=term)
-            expected_term = sum(float(s["amount"]) for s in structure)
-            payments_term = get_fee_payments(student_name=sel_student, term=term)
-            paid_term = sum(float(p["amount"]) for p in payments_term)
-            statement_rows.append([term.upper(), expected_term, paid_term, expected_term - paid_term])
-        statement_rows.append([])
-        statement_rows.append(["Date", "Term", "Amount", "Method", "Reference", "Recorded By"])
-        for p in payments:
-            statement_rows.append([
-                p.get("payment_date", ""),
-                (p.get("term") or "").upper(),
-                float(p.get("amount", 0)),
-                p.get("payment_method", ""),
-                p.get("reference", ""),
-                p.get("recorded_by", ""),
-            ])
-        statement_rows.append([])
-        statement_rows.append(["TOTAL PAID", ledger["paid"]])
-        statement_rows.append(["BALANCE", ledger["balance"]])
-
-        csv_df = pd.DataFrame(statement_rows)
-        csv_bytes = csv_df.to_csv(index=False, header=False).encode("utf-8")
-        safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", sel_student).strip("_")
-        st.download_button(
-            "⬇️ Download Statement CSV",
-            data=csv_bytes,
-            file_name=f"Fee_Statement_{safe_name}.csv",
-            mime="text/csv",
-            use_container_width=True
-        )
 elif page == "📊 Fee Reports":
     if st.session_state.user_role not in ["admin", "clerk"]:
         st.error("🔒 You don't have access to fee pages.")
@@ -4633,71 +4515,98 @@ elif page == "Settings":
     ])
 
     # ============================================================
+        # ============================================================
     # TAB 1: School Profile
     # ============================================================
     with tab_profile:
-        if st.session_state.user_role != "admin":
-            st.error("🔒 Only administrators can access School Profile settings.")
-            st.stop()
+        if st.session_state.user_role not in ["admin", "exams"]:
+            st.info("🔒 Only administrators and examination officers can access School Profile settings.")
+        else:
+            is_admin = st.session_state.user_role == "admin"
 
-        left, right = st.columns(2)
-        with left:
-            new_name = st.text_input("School name", value=st.session_state.school_name)
-            address = st.text_input("School address", value=st.session_state.school_address)
-            phone = st.text_input("School phone", value=st.session_state.school_phone)
-            email = st.text_input("School email", value=st.session_state.school_email)
-            motto = st.text_input("School motto", value=st.session_state.get("school_motto", ""), placeholder="e.g. Learn • Grow • Succeed")
-        with right:
-            academic_year = st.text_input("Academic year", value=st.session_state.academic_year)
-            current_term = st.selectbox(
-                "Current term", ["Term 1", "Term 2", "Term 3"],
-                index=["Term 1", "Term 2", "Term 3"].index(st.session_state.current_term)
-                if st.session_state.current_term in ["Term 1", "Term 2", "Term 3"] else 2
+            if not is_admin:
+                st.info("ℹ️ View-only mode. Only administrators can edit school profile settings.")
+
+            left, right = st.columns(2)
+            with left:
+                new_name = st.text_input("School name", value=st.session_state.school_name, disabled=not is_admin)
+                address = st.text_input("School address", value=st.session_state.school_address, disabled=not is_admin)
+                phone = st.text_input("School phone", value=st.session_state.school_phone, disabled=not is_admin)
+                email = st.text_input("School email", value=st.session_state.school_email, disabled=not is_admin)
+                motto = st.text_input("School motto", value=st.session_state.get("school_motto", ""), placeholder="e.g. Learn • Grow • Succeed", disabled=not is_admin)
+            with right:
+                academic_year = st.text_input("Academic year", value=st.session_state.academic_year, disabled=not is_admin)
+                current_term = st.selectbox(
+                    "Current term", ["Term 1", "Term 2", "Term 3"],
+                    index=["Term 1", "Term 2", "Term 3"].index(st.session_state.current_term)
+                    if st.session_state.current_term in ["Term 1", "Term 2", "Term 3"] else 2,
+                    disabled=not is_admin
+                )
+                if is_admin:
+                    logo = st.file_uploader("School logo", type=["png", "jpg", "jpeg"], key="school_logo_upload")
+                    if logo is not None:
+                        st.image(logo, width=120)
+                else:
+                    logo = None
+                    if st.session_state.get("school_logo"):
+                        st.image(st.session_state.school_logo, width=120)
+
+            st.divider()
+            st.write("### Report Card Signatures & Principal Comment")
+            sig_left, sig_right = st.columns(2)
+            with sig_left:
+                teacher_name = st.text_input("Class teacher name", value=st.session_state.class_teacher_name, disabled=not is_admin)
+                if is_admin:
+                    teacher_sig = st.file_uploader("Teacher signature", type=["png", "jpg", "jpeg"], key="teacher_signature_upload")
+                    if teacher_sig is not None:
+                        st.image(teacher_sig, width=180)
+                else:
+                    teacher_sig = None
+                    if st.session_state.get("teacher_signature"):
+                        st.image(st.session_state.teacher_signature, width=180)
+            with sig_right:
+                principal_name = st.text_input("Principal name", value=st.session_state.principal_name, disabled=not is_admin)
+                if is_admin:
+                    principal_sig = st.file_uploader("Principal signature", type=["png", "jpg", "jpeg"], key="principal_signature_upload")
+                    if principal_sig is not None:
+                        st.image(principal_sig, width=180)
+                else:
+                    principal_sig = None
+                    if st.session_state.get("principal_signature"):
+                        st.image(st.session_state.principal_signature, width=180)
+            principal_comment = st.text_area(
+                "Default Principal comment",
+                value=st.session_state.principal_comment,
+                height=100,
+                disabled=not is_admin
             )
-            logo = st.file_uploader("School logo", type=["png", "jpg", "jpeg"], key="school_logo_upload")
-            if logo is not None:
-                st.image(logo, width=120)
 
-        st.divider()
-        st.write("### Report Card Signatures & Principal Comment")
-        sig_left, sig_right = st.columns(2)
-        with sig_left:
-            teacher_name = st.text_input("Class teacher name", value=st.session_state.class_teacher_name)
-            teacher_sig = st.file_uploader("Teacher signature", type=["png", "jpg", "jpeg"], key="teacher_signature_upload")
-            if teacher_sig is not None:
-                st.image(teacher_sig, width=180)
-        with sig_right:
-            principal_name = st.text_input("Principal name", value=st.session_state.principal_name)
-            principal_sig = st.file_uploader("Principal signature", type=["png", "jpg", "jpeg"], key="principal_signature_upload")
-            if principal_sig is not None:
-                st.image(principal_sig, width=180)
-        principal_comment = st.text_area(
-            "Default Principal comment",
-            value=st.session_state.principal_comment,
-            height=100
-        )
+            if is_admin:
+                if st.button("Save School Profile", type="primary", use_container_width=True):
+                    st.session_state.school_name = new_name.strip() or DEFAULT_SCHOOL
+                    st.session_state.school_address = address.strip()
+                    st.session_state.school_phone = phone.strip()
+                    st.session_state.school_email = email.strip()
+                    st.session_state.school_motto = motto.strip()
+                    st.session_state.academic_year = academic_year.strip() or "2026"
+                    st.session_state.current_term = current_term
+                    st.session_state.class_teacher_name = teacher_name.strip() or "Class Teacher"
+                    st.session_state.principal_name = principal_name.strip() or "Principal / Head Teacher"
+                    st.session_state.principal_comment = principal_comment.strip()
+                    if logo is not None:
+                        st.session_state.school_logo = logo.getvalue()
+                    if teacher_sig is not None:
+                        st.session_state.teacher_signature = teacher_sig.getvalue()
+                    if principal_sig is not None:
+                        st.session_state.principal_signature = principal_sig.getvalue()
+                    save_school_settings()
+                    st.success("✅ Saved to cloud. These settings will persist across restarts.")
 
-        if st.button("Save School Profile", type="primary", use_container_width=True):
-            st.session_state.school_name = new_name.strip() or DEFAULT_SCHOOL
-            st.session_state.school_address = address.strip()
-            st.session_state.school_phone = phone.strip()
-            st.session_state.school_email = email.strip()
-            st.session_state.school_motto = motto.strip()
-            st.session_state.academic_year = academic_year.strip() or "2026"
-            st.session_state.current_term = current_term
-            st.session_state.class_teacher_name = teacher_name.strip() or "Class Teacher"
-            st.session_state.principal_name = principal_name.strip() or "Principal / Head Teacher"
-            st.session_state.principal_comment = principal_comment.strip()
-            if logo is not None:
-                st.session_state.school_logo = logo.getvalue()
-            if teacher_sig is not None:
-                st.session_state.teacher_signature = teacher_sig.getvalue()
-            if principal_sig is not None:
-                st.session_state.principal_signature = principal_sig.getvalue()
-            save_school_settings()
-            st.success("✅ Saved to cloud. These settings will persist across restarts.")
 
     # ============================================================
+        # ============================================================
+    # TAB 3: Teacher Accounts
+       # ============================================================
     # TAB 2: Change Password
     # ============================================================
     with tab_password:
@@ -4720,216 +4629,216 @@ elif page == "Settings":
                 else:
                     change_user_password(st.session_state.username, new_pw)
                     st.success("Password updated.")
-
-    # ============================================================
-    # TAB 3: Teacher Accounts
     # ============================================================
     with tab_teachers:
-        if st.session_state.user_role != "admin":
-            st.error("🔒 Only administrators can manage teacher accounts.")
-            st.stop()
-        st.caption("Create and manage teacher accounts. Each teacher gets their own username and password.")
-        teachers = get_teachers()
-        if teachers:
-            df_teachers = pd.DataFrame(teachers)
-            df_teachers.columns = ["Username", "Full Name"]
-            st.dataframe(df_teachers, use_container_width=True, hide_index=True)
+        if st.session_state.user_role not in ["admin"]:
+            st.info("🔒 Only administrators can manage teacher accounts.")
+        else:
+            st.caption("Create and manage teacher accounts. Each teacher gets their own username and password.")
+            teachers = get_teachers()
+            if teachers:
+                df_teachers = pd.DataFrame(teachers)
+                df_teachers.columns = ["Username", "Full Name"]
+                st.dataframe(df_teachers, use_container_width=True, hide_index=True)
 
-        t1, t2 = st.columns(2)
-        with t1:
-            teacher_username = st.text_input("Teacher username", placeholder="e.g. mr.kamau", key="new_teacher_username")
-            teacher_full_name = st.text_input("Teacher full name", placeholder="e.g. Mr. Peter Kamau", key="new_teacher_full_name")
-        with t2:
-            teacher_password = st.text_input("Teacher password", type="password", key="new_teacher_password")
-            st.caption("Password should be at least 6 characters.")
+            t1, t2 = st.columns(2)
+            with t1:
+                teacher_username = st.text_input("Teacher username", placeholder="e.g. mr.kamau", key="new_teacher_username")
+                teacher_full_name = st.text_input("Teacher full name", placeholder="e.g. Mr. Peter Kamau", key="new_teacher_full_name")
+            with t2:
+                teacher_password = st.text_input("Teacher password", type="password", key="new_teacher_password")
+                st.caption("Password should be at least 6 characters.")
 
-        tb1, tb2 = st.columns(2)
-        with tb1:
-            if st.button("➕ Create / Update Teacher", type="primary", use_container_width=True, key="create_teacher_btn"):
-                if not teacher_username.strip() or not teacher_full_name.strip() or not teacher_password.strip():
-                    st.error("Enter username, full name and password.")
-                elif len(teacher_password) < 6:
-                    st.error("Password must be at least 6 characters.")
-                else:
-                    try:
-                        create_or_update_teacher(teacher_username.strip(), teacher_full_name.strip(), teacher_password)
-                        st.success(f"Teacher '{teacher_username.strip()}' saved. Share the username and password with them.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-        with tb2:
-            with st.expander("🗑️ Delete a teacher"):
-                if teachers:
-                    delete_options = [t["username"] for t in teachers]
-                    selected_delete = st.selectbox("Select teacher to delete", delete_options, key="delete_teacher_select")
-                    confirm_del = st.checkbox("I understand this will remove the teacher account.", key="confirm_delete_teacher")
-                    if st.button("Delete Teacher", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_teacher_btn"):
+            tb1, tb2 = st.columns(2)
+            with tb1:
+                if st.button("➕ Create / Update Teacher", type="primary", use_container_width=True, key="create_teacher_btn"):
+                    if not teacher_username.strip() or not teacher_full_name.strip() or not teacher_password.strip():
+                        st.error("Enter username, full name and password.")
+                    elif len(teacher_password) < 6:
+                        st.error("Password must be at least 6 characters.")
+                    else:
                         try:
-                            delete_teacher(selected_delete)
-                            st.success(f"Deleted {selected_delete}.")
+                            create_or_update_teacher(teacher_username.strip(), teacher_full_name.strip(), teacher_password)
+                            st.success(f"Teacher '{teacher_username.strip()}' saved. Share the username and password with them.")
                             st.rerun()
                         except Exception as e:
                             st.error(f"Error: {e}")
-                else:
-                    st.info("No teachers to delete.")
-
-    # ============================================================
-    # TAB 4: Clerk Accounts
-    # ============================================================
-    with tab_clerks:
-        if st.session_state.user_role != "admin":
-            st.error("🔒 Only administrators can manage clerk accounts.")
-            st.stop()
-        st.caption("Create clerk accounts for bursars/accountants. Clerks see only fee pages.")
-        try:
-            clerk_rows = supabase.table("users").select("username,student_name").eq("role", "clerk").order("username").execute().data
-            if clerk_rows:
-                df_clerks = pd.DataFrame(clerk_rows)
-                df_clerks.columns = ["Username", "Full Name"]
-                st.dataframe(df_clerks, use_container_width=True, hide_index=True)
-        except Exception:
-            pass
-
-        ck1, ck2 = st.columns(2)
-        with ck1:
-            clerk_username = st.text_input("Clerk username", placeholder="e.g. bursar.jane", key="new_clerk_username")
-            clerk_full_name = st.text_input("Clerk full name", placeholder="e.g. Jane Wanjiru (Bursar)", key="new_clerk_full_name")
-        with ck2:
-            clerk_password = st.text_input("Clerk password", type="password", key="new_clerk_password")
-            st.caption("Password should be at least 6 characters.")
-
-        clerk_signature = st.file_uploader(
-            "Clerk signature (PNG/JPG, optional)",
-            type=["png", "jpg", "jpeg"],
-            key="new_clerk_signature"
-        )
-        if clerk_signature is not None:
-            st.image(clerk_signature, width=180, caption="Signature preview")
-
-        cb1, cb2 = st.columns(2)
-        with cb1:
-            if st.button("➕ Create / Update Clerk", type="primary", use_container_width=True, key="create_clerk_btn"):
-                if not clerk_username.strip() or not clerk_full_name.strip() or not clerk_password.strip():
-                    st.error("Enter username, full name and password.")
-                elif len(clerk_password) < 6:
-                    st.error("Password must be at least 6 characters.")
-                else:
-                    try:
-                        hashed = hash_password(clerk_password)
-                        sig_b64 = None
-                        if clerk_signature is not None:
-                            sig_b64 = base64.b64encode(clerk_signature.getvalue()).decode("utf-8")
-
-                        existing = supabase.table("users").select("username").eq("username", clerk_username.strip()).execute()
-                        if existing.data:
-                            update_payload = {
-                                "password": hashed, "role": "clerk",
-                                "student_name": clerk_full_name.strip()
-                            }
-                            if sig_b64 is not None:
-                                update_payload["signature_base64"] = sig_b64
-                            supabase.table("users").update(update_payload).eq("username", clerk_username.strip()).execute()
-                        else:
-                            insert_payload = {
-                                "username": clerk_username.strip(), "password": hashed,
-                                "role": "clerk", "student_name": clerk_full_name.strip()
-                            }
-                            if sig_b64 is not None:
-                                insert_payload["signature_base64"] = sig_b64
-                            supabase.table("users").insert(insert_payload).execute()
-                        st.success(f"✅ Clerk '{clerk_username.strip()}' saved. Share the username and password with them.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Error: {e}")
-        with cb2:
-            with st.expander("🗑️ Delete a clerk"):
-                try:
-                    clerk_list = supabase.table("users").select("username").eq("role", "clerk").order("username").execute().data
-                    if clerk_list:
-                        delete_options = [c["username"] for c in clerk_list]
-                        selected_delete = st.selectbox("Select clerk to delete", delete_options, key="delete_clerk_select")
-                        confirm_del = st.checkbox("I understand this will remove the clerk account.", key="confirm_delete_clerk")
-                        if st.button("Delete Clerk", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_clerk_btn"):
+            with tb2:
+                with st.expander("🗑️ Delete a teacher"):
+                    if teachers:
+                        delete_options = [t["username"] for t in teachers]
+                        selected_delete = st.selectbox("Select teacher to delete", delete_options, key="delete_teacher_select")
+                        confirm_del = st.checkbox("I understand this will remove the teacher account.", key="confirm_delete_teacher")
+                        if st.button("Delete Teacher", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_teacher_btn"):
                             try:
-                                supabase.table("users").delete().eq("username", selected_delete).eq("role", "clerk").execute()
+                                delete_teacher(selected_delete)
                                 st.success(f"Deleted {selected_delete}.")
                                 st.rerun()
                             except Exception as e:
                                 st.error(f"Error: {e}")
                     else:
-                        st.info("No clerks to delete.")
-                except Exception:
-                    st.info("No clerks to delete.")
+                        st.info("No teachers to delete.")
 
     # ============================================================
+        # ============================================================
+        # ============================================================
+    # TAB 4: Clerk Accounts
+    # ============================================================
+    with tab_clerks:
+        if st.session_state.user_role not in ["admin"]:
+            st.info("🔒 Only administrators can manage clerk accounts.")
+        else:
+            st.caption("Create clerk accounts for bursars/accountants. Clerks see only fee pages.")
+            try:
+                clerk_rows = supabase.table("users").select("username,student_name").eq("role", "clerk").order("username").execute().data
+                if clerk_rows:
+                    df_clerks = pd.DataFrame(clerk_rows)
+                    df_clerks.columns = ["Username", "Full Name"]
+                    st.dataframe(df_clerks, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
+            ck1, ck2 = st.columns(2)
+            with ck1:
+                clerk_username = st.text_input("Clerk username", placeholder="e.g. bursar.jane", key="new_clerk_username")
+                clerk_full_name = st.text_input("Clerk full name", placeholder="e.g. Jane Wanjiru (Bursar)", key="new_clerk_full_name")
+            with ck2:
+                clerk_password = st.text_input("Clerk password", type="password", key="new_clerk_password")
+                st.caption("Password should be at least 6 characters.")
+
+            clerk_signature = st.file_uploader(
+                "Clerk signature (PNG/JPG, optional)",
+                type=["png", "jpg", "jpeg"],
+                key="new_clerk_signature"
+            )
+            if clerk_signature is not None:
+                st.image(clerk_signature, width=180, caption="Signature preview")
+
+            cb1, cb2 = st.columns(2)
+            with cb1:
+                if st.button("➕ Create / Update Clerk", type="primary", use_container_width=True, key="create_clerk_btn"):
+                    if not clerk_username.strip() or not clerk_full_name.strip() or not clerk_password.strip():
+                        st.error("Enter username, full name and password.")
+                    elif len(clerk_password) < 6:
+                        st.error("Password must be at least 6 characters.")
+                    else:
+                        try:
+                            hashed = hash_password(clerk_password)
+                            sig_b64 = None
+                            if clerk_signature is not None:
+                                sig_b64 = base64.b64encode(clerk_signature.getvalue()).decode("utf-8")
+
+                            existing = supabase.table("users").select("username").eq("username", clerk_username.strip()).execute()
+                            if existing.data:
+                                update_payload = {
+                                    "password": hashed, "role": "clerk",
+                                    "student_name": clerk_full_name.strip()
+                                }
+                                if sig_b64 is not None:
+                                    update_payload["signature_base64"] = sig_b64
+                                supabase.table("users").update(update_payload).eq("username", clerk_username.strip()).execute()
+                            else:
+                                insert_payload = {
+                                    "username": clerk_username.strip(), "password": hashed,
+                                    "role": "clerk", "student_name": clerk_full_name.strip()
+                                }
+                                if sig_b64 is not None:
+                                    insert_payload["signature_base64"] = sig_b64
+                                supabase.table("users").insert(insert_payload).execute()
+                            st.success(f"✅ Clerk '{clerk_username.strip()}' saved. Share the username and password with them.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+            with cb2:
+                with st.expander("🗑️ Delete a clerk"):
+                    try:
+                        clerk_list = supabase.table("users").select("username").eq("role", "clerk").order("username").execute().data
+                        if clerk_list:
+                            delete_options = [c["username"] for c in clerk_list]
+                            selected_delete = st.selectbox("Select clerk to delete", delete_options, key="delete_clerk_select")
+                            confirm_del = st.checkbox("I understand this will remove the clerk account.", key="confirm_delete_clerk")
+                            if st.button("Delete Clerk", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_clerk_btn"):
+                                try:
+                                    supabase.table("users").delete().eq("username", selected_delete).eq("role", "clerk").execute()
+                                    st.success(f"Deleted {selected_delete}.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                        else:
+                            st.info("No clerks to delete.")
+                    except Exception:
+                        st.info("No clerks to delete.")
+
+
+
+        # ============================================================
     # TAB 5: Parent Accounts
     # ============================================================
     with tab_parents:
-        if st.session_state.user_role != "admin":
-            st.error("🔒 Only administrators can manage parent accounts.")
-            st.stop()
-        st.caption("Link a parent account to one or more student names. Use | between multiple children.")
-        try:
-            parent_rows = supabase.table("parents").select("username,parent_name,child_names").order("username").execute().data
-            if parent_rows:
-                st.dataframe(pd.DataFrame(parent_rows), use_container_width=True, hide_index=True)
-        except Exception:
-            pass
+        if st.session_state.user_role not in ["admin", "exams"]:
+            st.info("🔒 Only administrators and examination officers can manage parent accounts.")
+        else:
+            st.caption("Link a parent account to one or more student names. Use | between multiple children.")
+            try:
+                parent_rows = supabase.table("parents").select("username,parent_name,child_names").order("username").execute().data
+                if parent_rows:
+                    st.dataframe(pd.DataFrame(parent_rows), use_container_width=True, hide_index=True)
+            except Exception:
+                pass
 
-        pa1, pa2 = st.columns(2)
-        with pa1:
-            parent_username = st.text_input("Parent username", key="new_parent_username")
-            parent_name = st.text_input("Parent / Guardian name", key="new_parent_name")
-        with pa2:
-            parent_password = st.text_input("Parent password", type="password", key="new_parent_password")
-            linked_children = st.text_input("Linked student name(s)", placeholder="e.g. Jane Wanjiku | Peter Kamau", key="new_parent_children")
+            pa1, pa2 = st.columns(2)
+            with pa1:
+                parent_username = st.text_input("Parent username", key="new_parent_username")
+                parent_name = st.text_input("Parent / Guardian name", key="new_parent_name")
+            with pa2:
+                parent_password = st.text_input("Parent password", type="password", key="new_parent_password")
+                linked_children = st.text_input("Linked student name(s)", placeholder="e.g. Jane Wanjiku | Peter Kamau", key="new_parent_children")
 
-        if st.button("➕ Create / Update Parent Account", type="primary", use_container_width=True):
-            if not parent_username.strip() or not parent_name.strip() or not parent_password.strip() or not linked_children.strip():
-                st.error("Fill in all fields.")
-            else:
-                try:
-                    create_or_update_parent(parent_username.strip(), parent_name.strip(), parent_password, linked_children.strip())
-                    st.success("Parent account saved to cloud.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
+            if st.button("➕ Create / Update Parent Account", type="primary", use_container_width=True):
+                if not parent_username.strip() or not parent_name.strip() or not parent_password.strip() or not linked_children.strip():
+                    st.error("Fill in all fields.")
+                else:
+                    try:
+                        create_or_update_parent(parent_username.strip(), parent_name.strip(), parent_password, linked_children.strip())
+                        st.success("Parent account saved to cloud.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
     # ============================================================
+        # ============================================================
     # TAB 6: Student Accounts
     # ============================================================
     with tab_students:
-        if st.session_state.user_role != "admin":
-            st.error("🔒 Only administrators can manage student accounts.")
-            st.stop()
-        st.caption("Link a student account to one student name so the student can view their own results.")
-        try:
-            student_rows = supabase.table("students").select("username,student_full_name").order("username").execute().data
-            if student_rows:
-                st.dataframe(pd.DataFrame(student_rows), use_container_width=True, hide_index=True)
-        except Exception:
-            pass
+        if st.session_state.user_role not in ["admin", "exams"]:
+            st.info("🔒 Only administrators and examination officers can manage student accounts.")
+        else:
+            st.caption("Link a student account to one student name so the student can view their own results.")
+            try:
+                student_rows = supabase.table("students").select("username,student_full_name").order("username").execute().data
+                if student_rows:
+                    st.dataframe(pd.DataFrame(student_rows), use_container_width=True, hide_index=True)
+            except Exception:
+                pass
 
-        sa1, sa2 = st.columns(2)
-        with sa1:
-            student_username = st.text_input("Student username", key="new_student_username")
-            student_full_name = st.text_input("Linked student name", placeholder="e.g. John Mwangi", key="new_student_full_name")
-        with sa2:
-            student_password = st.text_input("Student password", type="password", key="new_student_password")
+            sa1, sa2 = st.columns(2)
+            with sa1:
+                student_username = st.text_input("Student username", key="new_student_username")
+                student_full_name = st.text_input("Linked student name", placeholder="e.g. John Mwangi", key="new_student_full_name")
+            with sa2:
+                student_password = st.text_input("Student password", type="password", key="new_student_password")
 
-        if st.button("➕ Create / Update Student Account", type="primary", use_container_width=True):
-            if not student_username.strip() or not student_full_name.strip() or not student_password.strip():
-                st.error("Fill in all fields.")
-            else:
-                try:
-                    create_or_update_student(student_username.strip(), student_full_name.strip(), student_password)
-                    st.success("Student account saved to cloud.")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Error: {e}")
+            if st.button("➕ Create / Update Student Account", type="primary", use_container_width=True):
+                if not student_username.strip() or not student_full_name.strip() or not student_password.strip():
+                    st.error("Fill in all fields.")
+                else:
+                    try:
+                        create_or_update_student(student_username.strip(), student_full_name.strip(), student_password)
+                        st.success("Student account saved to cloud.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
 
-    # ============================================================
-    # TAB 7: Excel Format Guide
     # ============================================================
     with tab_format:
         st.subheader("📄 Excel Format Guide")
@@ -5022,28 +4931,32 @@ For **every term**, the app expects 3 types of columns:
             )
 
     # ============================================================
+        # ============================================================
     # TAB 8: Backup & Data
     # ============================================================
     with tab_backup:
-        st.write("### Download a full backup")
-        st.caption("ZIP with all cloud tables as JSON files.")
-        if st.button("Prepare Backup ZIP", type="primary", use_container_width=True):
-            with st.spinner("Packaging backup..."):
-                backup = create_backup_zip()
-            st.download_button(
-                "⬇️ Download Backup ZIP",
-                data=backup.getvalue(),
-                file_name=f"Academic_System_Backup_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
-                mime="application/zip",
-                use_container_width=True
-            )
+        if st.session_state.user_role not in ["admin", "teacher", "exams"]:
+            st.info("🔒 Only administrators, teachers and examination officers can access Backup.")
+        else:
+            st.write("### Download a full backup")
+            st.caption("ZIP with all cloud tables as JSON files.")
+            if st.button("Prepare Backup ZIP", type="primary", use_container_width=True):
+                with st.spinner("Packaging backup..."):
+                    backup = create_backup_zip()
+                st.download_button(
+                    "⬇️ Download Backup ZIP",
+                    data=backup.getvalue(),
+                    file_name=f"Academic_System_Backup_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+                    mime="application/zip",
+                    use_container_width=True
+                )
 
-        st.divider()
-        st.write("### Current data")
-        st.write(f"**File:** {st.session_state.raw_file_name or 'No file loaded'}")
-        if data is not None:
-            st.write(f"**Analysis term:** {data['analysis_term'].upper()}")
-            st.write(f"**Students:** {len(df)}")
-            st.write(f"**Streams:** {df[stream_col].nunique()}")
+            st.divider()
+            st.write("### Current data")
+            st.write(f"**File:** {st.session_state.raw_file_name or 'No file loaded'}")
+            if data is not None:
+                st.write(f"**Analysis term:** {data['analysis_term'].upper()}")
+                st.write(f"**Students:** {len(df)}")
+                st.write(f"**Streams:** {df[stream_col].nunique()}")
 
-        st.success("✅ All data is stored in Supabase — it persists across app restarts.")
+            st.success("✅ All data is stored in Supabase — it persists across app restarts.")
