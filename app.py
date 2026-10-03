@@ -988,6 +988,608 @@ def generate_defaulters_pdf(rows, threshold, term_label, school_name):
     doc.build(story)
     buf.seek(0)
     return buf
+# ============================================================
+# TIMETABLE HELPERS
+# ============================================================
+
+def tt_get_periods():
+    """Return all periods sorted by period_no (breaks are negative)."""
+    try:
+        result = supabase.table("tt_periods").select("*").execute()
+        rows = result.data or []
+        teaching = [r for r in rows if not r.get("is_break")]
+        breaks = [r for r in rows if r.get("is_break")]
+        return sorted(teaching, key=lambda x: x["period_no"]), breaks
+    except Exception:
+        return [], []
+
+
+def tt_get_subjects():
+    """Return all subjects with their period rules."""
+    try:
+        result = supabase.table("tt_subjects").select("*").order("subject_name").execute()
+        return result.data or []
+    except Exception:
+        return []
+
+
+def tt_get_teachers():
+    """Return all teachers."""
+    try:
+        result = supabase.table("tt_teachers").select("*").order("full_name").execute()
+        return result.data or []
+    except Exception:
+        return []
+
+
+def tt_create_or_update_teacher(full_name, subjects_taught, max_periods_per_day=6):
+    """Create a teacher, or update if the name already exists."""
+    existing = supabase.table("tt_teachers").select("id").eq("full_name", full_name.strip()).execute()
+    payload = {
+        "full_name": full_name.strip(),
+        "subjects_taught": subjects_taught.strip(),
+        "max_periods_per_day": int(max_periods_per_day),
+    }
+    if existing.data:
+        supabase.table("tt_teachers").update(payload).eq("id", existing.data[0]["id"]).execute()
+        return existing.data[0]["id"]
+    else:
+        result = supabase.table("tt_teachers").insert(payload).execute()
+        return result.data[0]["id"] if result.data else None
+
+
+def tt_delete_teacher(teacher_id):
+    """Delete a teacher. Their class assignments revert to NULL."""
+    try:
+        supabase.table("tt_teachers").delete().eq("id", teacher_id).execute()
+    except Exception:
+        pass
+
+
+def tt_get_class_teacher_assignments(class_name=None):
+    """Return assignments. If class_name given, filter to that class."""
+    try:
+        query = supabase.table("tt_class_teacher").select("*")
+        if class_name:
+            query = query.eq("class_name", class_name)
+        result = query.order("class_name").order("subject_name").execute()
+        return result.data or []
+    except Exception:
+        return []
+
+
+def tt_assign_teacher(class_name, subject_name, teacher_id, periods_per_week):
+    """Set the teacher for a class+subject combination."""
+    existing = supabase.table("tt_class_teacher").select("id").eq("class_name", class_name).eq("subject_name", subject_name).execute()
+    payload = {
+        "class_name": class_name,
+        "subject_name": subject_name,
+        "teacher_id": teacher_id,
+        "periods_per_week": int(periods_per_week),
+    }
+    if existing.data:
+        supabase.table("tt_class_teacher").update(payload).eq("id", existing.data[0]["id"]).execute()
+    else:
+        supabase.table("tt_class_teacher").insert(payload).execute()
+
+
+def tt_get_all_classes():
+    """Return sorted list of all class names."""
+    try:
+        result = supabase.table("tt_class_teacher").select("class_name").execute()
+        rows = result.data or []
+        return sorted(set(r["class_name"] for r in rows))
+    except Exception:
+        return []
+
+
+def tt_count_generated():
+    """How many rows exist in the generated timetable."""
+    try:
+        result = supabase.table("tt_generated").select("id").execute()
+        return len(result.data or [])
+    except Exception:
+        return 0
+
+def tt_generate_timetable(max_seconds=120):
+    """
+    Generate a complete timetable using Google OR-Tools.
+    Writes results to the tt_generated table.
+    Returns a dict with 'success', 'message', 'stats'.
+    """
+    from ortools.sat.python import cp_model
+
+    # ---- Read inputs ----
+    teachers = supabase.table("tt_teachers").select("*").execute().data or []
+    subjects = supabase.table("tt_subjects").select("*").execute().data or []
+    assignments = supabase.table("tt_class_teacher").select("*").execute().data or []
+    periods, breaks = tt_get_periods()
+
+    if not teachers or not subjects or not assignments:
+        return {"success": False, "message": "Missing setup data — add teachers/subjects/assignments first."}
+
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    period_nos = sorted([p["period_no"] for p in periods])
+    all_classes = sorted(set(a["class_name"] for a in assignments))
+
+    teacher_by_id = {t["id"]: t for t in teachers}
+    subject_by_name = {s["subject_name"]: s for s in subjects}
+
+    # Build a demand list: (class, subject, teacher_id, periods_per_week)
+    demand = []
+    for a in assignments:
+        demand.append({
+            "class": a["class_name"],
+            "subject": a["subject_name"],
+            "teacher_id": a["teacher_id"],
+            "ppw": int(a["periods_per_week"] or 0),
+        })
+
+    # ---- Model ----
+    model = cp_model.CpModel()
+    x = {}  # x[class][subject][day_idx][period_idx] = BoolVar
+
+    # One decision variable per (class, subject, day, period)
+    for d in demand:
+        c = d["class"]
+        s = d["subject"]
+        for di in range(len(days)):
+            for pi in range(len(period_nos)):
+                x[(c, s, di, pi)] = model.NewBoolVar(f"x_{c}_{s}_{di}_{pi}")
+
+    # Constraint 1: each class has exactly one subject per (day, period)
+    for c in all_classes:
+        for di in range(len(days)):
+            for pi in range(len(period_nos)):
+                model.Add(sum(x[(c, s, di, pi)] for s in subject_by_name.keys() if (c, s, di, pi) in x) == 1)
+
+    # Constraint 2: subject meets its weekly period count per class
+    for d in demand:
+        c = d["class"]
+        s = d["subject"]
+        ppw = d["ppw"]
+        vars_for_subject = [x[(c, s, di, pi)] for di in range(len(days)) for pi in range(len(period_nos))]
+        model.Add(sum(vars_for_subject) == ppw)
+
+    # Constraint 3: no teacher in two places at the same (day, period)
+    teacher_usage = {}  # (teacher_id, day, period) -> list of vars
+    for d in demand:
+        if d["teacher_id"] is None:
+            continue
+        c, s, tid = d["class"], d["subject"], d["teacher_id"]
+        for di in range(len(days)):
+            for pi in range(len(period_nos)):
+                key = (tid, di, pi)
+                teacher_usage.setdefault(key, []).append(x[(c, s, di, pi)])
+    for key, vars_list in teacher_usage.items():
+        if len(vars_list) > 1:
+            model.Add(sum(vars_list) <= 1)
+
+        # Constraint 4: Assembly — Mon P1 AND Fri P1 for all classes
+    mon_idx = 0
+    fri_idx = 4
+    p1_idx = period_nos.index(min(period_nos))
+    for d in demand:
+        if d["subject"] == "Assembly":
+            c = d["class"]
+            model.Add(x[(c, "Assembly", mon_idx, p1_idx)] == 1)
+            model.Add(x[(c, "Assembly", fri_idx, p1_idx)] == 1)
+            # Assembly cannot be anywhere else
+            for di in range(len(days)):
+                for pi in range(len(period_nos)):
+                    if not ((di == mon_idx and pi == p1_idx) or (di == fri_idx and pi == p1_idx)):
+                        model.Add(x[(c, "Assembly", di, pi)] == 0)
+
+    # Constraint 5: Doubles for Chemistry and Biology (2 consecutive periods)
+    for d in demand:
+        if d["subject"] in ["Chemistry", "Biology"] and subject_by_name.get(d["subject"], {}).get("has_double"):
+            c, s = d["class"], d["subject"]
+            # At least one consecutive pair must be on the same day
+            double_options = []
+            for di in range(len(days)):
+                for pi in range(len(period_nos) - 1):
+                    pair_var = model.NewBoolVar(f"pair_{c}_{s}_{di}_{pi}")
+                    model.Add(pair_var <= x[(c, s, di, pi)])
+                    model.Add(pair_var <= x[(c, s, di, pi + 1)])
+                    double_options.append(pair_var)
+            model.Add(sum(double_options) >= 1)
+
+    # Constraint 6: No double free-study blocks, no Free Study on Mon P1 or Fri P1
+    for c in all_classes:
+        model.Add(x[(c, "Free Study", mon_idx, p1_idx)] == 0)
+        model.Add(x[(c, "Free Study", fri_idx, p1_idx)] == 0)
+
+    # ---- Solve ----
+    solver = cp_model.CpSolver()
+    solver.parameters.max_time_in_seconds = max_seconds
+    solver.parameters.num_search_workers = 4
+
+    status = solver.Solve(model)
+    status_name = solver.StatusName(status)
+
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        return {
+            "success": False,
+            "message": f"Solver could not find a solution (status: {status_name}). Try increasing max_seconds or relaxing constraints.",
+            "stats": {"status": status_name},
+        }
+
+    # ---- Save result ----
+    supabase.table("tt_generated").delete().neq("id", 0).execute()
+
+    rows_to_insert = []
+    for d in demand:
+        c, s, tid = d["class"], d["subject"], d["teacher_id"]
+        for di in range(len(days)):
+            for pi in range(len(period_nos)):
+                if solver.Value(x[(c, s, di, pi)]) == 1:
+                    room = None
+                    if s == "Chemistry":
+                        room = "Chemistry Lab"
+                    elif s == "Biology":
+                        room = "Biology Lab"
+                    elif s == "Computer":
+                        room = "Computer Lab"
+                    rows_to_insert.append({
+                        "class_name": c,
+                        "day_of_week": days[di],
+                        "period_no": period_nos[pi],
+                        "subject_name": s,
+                        "teacher_id": tid,
+                        "room": room,
+                    })
+
+    # Insert in chunks to avoid big requests
+    chunk_size = 500
+    for i in range(0, len(rows_to_insert), chunk_size):
+        supabase.table("tt_generated").insert(rows_to_insert[i:i + chunk_size]).execute()
+
+    return {
+        "success": True,
+        "message": f"Timetable generated — {len(rows_to_insert)} slots placed.",
+        "stats": {
+            "status": status_name,
+            "slots": len(rows_to_insert),
+            "wall_time": round(solver.WallTime(), 2),
+        },
+    }
+
+def tt_get_generated(class_name=None, teacher_id=None, room=None):
+    """Read the generated timetable with optional filters."""
+    try:
+        query = supabase.table("tt_generated").select("*")
+        if class_name:
+            query = query.eq("class_name", class_name)
+        if teacher_id is not None:
+            query = query.eq("teacher_id", teacher_id)
+        if room:
+            query = query.eq("room", room)
+        result = query.execute()
+        return result.data or []
+    except Exception:
+        return []
+
+
+def tt_build_grid(rows, teacher_map):
+    """Turn a list of timetable rows into a week grid DataFrame with break rows."""
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+
+    # Get periods + breaks with times
+    periods, breaks = tt_get_periods()
+    period_nos = sorted([p["period_no"] for p in periods])
+    period_time = {p["period_no"]: f"{p.get('start_time','')} – {p.get('end_time','')}".strip(" –") for p in periods}
+    break_list = sorted(breaks, key=lambda b: b.get("start_time") or "")
+
+    # Build matrix
+    matrix = {p: {d: "" for d in days} for p in period_nos}
+    for r in rows:
+        p = r.get("period_no")
+        d = r.get("day_of_week")
+        if p not in matrix or d not in matrix[p]:
+            continue
+        subj = r.get("subject_name") or ""
+        tid = r.get("teacher_id")
+        teacher_name = teacher_map.get(tid, "") if tid else ""
+        room = r.get("room") or ""
+
+        parts = [subj]
+        if teacher_name:
+            parts.append(teacher_name)
+        if room:
+            parts.append(f"[{room}]")
+        matrix[p][d] = " · ".join(parts)
+
+    # Build output rows: insert break rows
+    out_rows = []
+    break_by_after_period = {}
+    for b in break_list:
+        # Use label like "Morning Break" and start/end time
+        label = b.get("break_label") or "Break"
+        t = f"{b.get('start_time','')} – {b.get('end_time','')}".strip(" –")
+        # Determine which period comes BEFORE this break
+        # We figure this out by comparing times
+        prev_period = None
+        for p in periods:
+            if p.get("end_time") == b.get("start_time"):
+                prev_period = p["period_no"]
+                break
+        if prev_period is not None:
+            break_by_after_period.setdefault(prev_period, []).append(f"{label}  ({t})")
+
+    for p in period_nos:
+        time_label = period_time[p] if period_time[p] else f"Period {p}"
+        out_rows.append({
+            "Time": time_label,
+            **{d: matrix[p][d] for d in days},
+            "_is_break": False,
+        })
+        # Insert any breaks that follow this period
+        if p in break_by_after_period:
+            for brk in break_by_after_period[p]:
+                out_rows.append({
+                    "Time": brk,
+                    **{d: "" for d in days},
+                    "_is_break": True,
+                })
+
+    df = pd.DataFrame(out_rows)
+    return df
+
+
+def tt_generate_pdf(rows, title, school_name, teacher_map):
+    """Generate a PDF timetable with real times and break rows. Fits one page."""
+    from reportlab.lib.pagesizes import A4, landscape
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.lib.units import mm
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    from reportlab.platypus import Image as RLImage
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf,
+        pagesize=landscape(A4),
+        leftMargin=8*mm,
+        rightMargin=8*mm,
+        topMargin=8*mm,
+        bottomMargin=8*mm,
+    )
+
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("TTTitle", parent=styles["Title"],
+                                 fontName="Helvetica-Bold", fontSize=14, leading=16, alignment=1)
+    subtitle_style = ParagraphStyle("TTSubtitle", parent=styles["Normal"],
+                                    fontSize=10, leading=12, alignment=1,
+                                    textColor=colors.HexColor("#555555"))
+    meta_style = ParagraphStyle("TTMeta", parent=styles["Normal"],
+                                fontSize=7, leading=9, alignment=1,
+                                textColor=colors.HexColor("#777777"))
+    time_style = ParagraphStyle("TTTime", parent=styles["Normal"],
+                                fontName="Helvetica-Bold", fontSize=8, leading=10,
+                                alignment=1, textColor=colors.HexColor("#222222"))
+    cell_subject = ParagraphStyle("CellSubject", parent=styles["Normal"],
+                                  fontName="Helvetica-Bold", fontSize=7.5, leading=9, alignment=1)
+    cell_teacher = ParagraphStyle("CellTeacher", parent=styles["Normal"],
+                                  fontSize=6.5, leading=8, alignment=1,
+                                  textColor=colors.HexColor("#333333"))
+    cell_room = ParagraphStyle("CellRoom", parent=styles["Normal"],
+                               fontSize=5.5, leading=7, alignment=1,
+                               textColor=colors.HexColor("#006600"),
+                               fontName="Helvetica-Oblique")
+    cell_empty = ParagraphStyle("CellEmpty", parent=styles["Normal"],
+                                fontSize=6.5, leading=8, alignment=1,
+                                textColor=colors.HexColor("#999999"))
+    break_style = ParagraphStyle("TTBreak", parent=styles["Normal"],
+                                 fontName="Helvetica-Oblique", fontSize=7.5, leading=9,
+                                 alignment=1, textColor=colors.HexColor("#444444"))
+
+    story = []
+
+    # Header with logo
+    logo = st.session_state.get("school_logo")
+    if logo:
+        try:
+            logo_img = RLImage(io.BytesIO(logo), width=14*mm, height=14*mm)
+            header_table = Table([[logo_img, Paragraph(f"<b>{school_name}</b><br/>{title}", subtitle_style)]],
+                                 colWidths=[18*mm, None])
+            header_table.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (1, 0), (1, 0), "LEFT"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 0),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 0),
+                ("TOPPADDING", (0, 0), (-1, -1), 0),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 0),
+            ]))
+            story.append(header_table)
+        except Exception:
+            story.append(Paragraph(f"<b>{school_name}</b>", title_style))
+            story.append(Paragraph(title, subtitle_style))
+    else:
+        story.append(Paragraph(f"<b>{school_name}</b>", title_style))
+        story.append(Paragraph(title, subtitle_style))
+
+    story.append(Paragraph(
+        f"Academic Year {st.session_state.get('academic_year', '')} · {st.session_state.get('current_term', '')}",
+        meta_style
+    ))
+    story.append(Spacer(1, 3))
+
+    # Get periods + breaks
+    periods, breaks = tt_get_periods()
+    period_nos = sorted([p["period_no"] for p in periods])
+    period_time = {p["period_no"]: f"{p.get('start_time','')} – {p.get('end_time','')}".strip(" –") for p in periods}
+    break_list = sorted(breaks, key=lambda b: b.get("start_time") or "")
+
+    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+
+    matrix = {p: {d: None for d in days} for p in period_nos}
+    for r in rows:
+        p = r.get("period_no")
+        d = r.get("day_of_week")
+        if p not in matrix or d not in matrix[p]:
+            continue
+        matrix[p][d] = r
+
+    # Build break labels per preceding period
+    break_by_after_period = {}
+    for b in break_list:
+        label = b.get("break_label") or "Break"
+        t = f"{b.get('start_time','')} – {b.get('end_time','')}".strip(" –")
+        prev_period = None
+        for p in periods:
+            if p.get("end_time") == b.get("start_time"):
+                prev_period = p["period_no"]
+                break
+        if prev_period is not None:
+            break_by_after_period.setdefault(prev_period, []).append(f"☕ {label} · {t}")
+
+    # Header row
+    header = [Paragraph("<b>Time</b>", cell_subject)]
+    for d in days:
+        header.append(Paragraph(f"<b>{d}</b>", cell_subject))
+    table_data = [header]
+    row_heights = [8*mm]
+    style_rules = [
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#333333")),
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#263238")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("BACKGROUND", (0, 1), (0, -1), colors.HexColor("#f0f0f0")),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+        ("LEFTPADDING", (0, 0), (-1, -1), 1),
+        ("RIGHTPADDING", (0, 0), (-1, -1), 1),
+    ]
+
+    for p in period_nos:
+        time_label = period_time[p] if period_time[p] else f"P{p}"
+        row = [Paragraph(time_label, time_style)]
+        for d in days:
+            r = matrix[p][d]
+            if r is None:
+                row.append(Paragraph("—", cell_empty))
+                continue
+            subj = r.get("subject_name") or ""
+            cls = r.get("class_name") or ""
+            tid = r.get("teacher_id")
+            teacher_name = teacher_map.get(tid, "") if tid else ""
+            room = r.get("room") or ""
+
+            # Show class name only on TEACHER PDFs, not on CLASS PDFs
+            is_class_pdf = "CLASS TIMETABLE" in title
+
+            cell_parts = [Paragraph(subj, cell_subject)]
+            if not is_class_pdf and cls:
+                cell_parts.append(Paragraph(cls, cell_teacher))
+            if teacher_name:
+                cell_parts.append(Paragraph(teacher_name, cell_teacher))
+            if room:
+                cell_parts.append(Paragraph(f"[{room}]", cell_room))
+            row.append(cell_parts)
+        table_data.append(row)
+        row_heights.append(14*mm)
+
+        # Add break row if any
+        if p in break_by_after_period:
+            for brk in break_by_after_period[p]:
+                break_row = [Paragraph(brk, break_style)]
+                for _ in days:
+                    break_row.append("")
+                table_data.append(break_row)
+                row_heights.append(6*mm)
+                # Style break row (grey background)
+                break_row_index = len(table_data) - 1
+                style_rules.append(
+                    ("BACKGROUND", (0, break_row_index), (-1, break_row_index), colors.HexColor("#eaeaea"))
+                )
+                style_rules.append(
+                    ("SPAN", (0, break_row_index), (-1, break_row_index))
+                )
+
+    col_widths = [22*mm] + [(doc.width - 22*mm) / 5] * 5
+    table = Table(table_data, colWidths=col_widths, rowHeights=row_heights)
+    table.setStyle(TableStyle(style_rules))
+
+    story.append(table)
+    story.append(Spacer(1, 3))
+    story.append(Paragraph(
+        f"Generated on {datetime.now().strftime('%d %B %Y at %H:%M')} · Official Timetable · {school_name}",
+        meta_style
+    ))
+    story.append(Paragraph(
+        "<b>Generated by SAM System</b>",
+        meta_style
+    ))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf
+
+
+
+
+
+
+
+  
+
+def tt_teacher_load_report():
+    """Calculate each teacher's weekly load from assignments."""
+    try:
+        teachers = supabase.table("tt_teachers").select("*").execute().data or []
+        assignments = supabase.table("tt_class_teacher").select("*").execute().data or []
+
+        teacher_by_id = {t["id"]: t for t in teachers}
+        loads = {}
+
+        for a in assignments:
+            if a.get("teacher_id") is None:
+                continue
+            tid = a["teacher_id"]
+            if tid not in loads:
+                loads[tid] = {"subjects": {}, "total": 0, "classes": 0}
+            subj = a["subject_name"]
+            ppw = int(a["periods_per_week"] or 0)
+            loads[tid]["subjects"][subj] = loads[tid]["subjects"].get(subj, 0) + ppw
+            loads[tid]["total"] += ppw
+            loads[tid]["classes"] += 1
+
+        rows = []
+        for tid, load in loads.items():
+            t = teacher_by_id.get(tid, {})
+            subject_summary = ", ".join(f"{s}({p})" for s, p in load["subjects"].items())
+            max_pw = (t.get("max_periods_per_day") or 6) * 5
+            status = "✅ OK" if load["total"] <= max_pw else "❌ OVERLOADED"
+            rows.append({
+                "Teacher": t.get("full_name", "?"),
+                "Subjects Taught": t.get("subjects_taught", ""),
+                "Classes": load["classes"],
+                "Periods/Week": load["total"],
+                "Max": max_pw,
+                "Status": status,
+                "Breakdown": subject_summary,
+            })
+        rows.sort(key=lambda r: -r["Periods/Week"])
+
+        assigned_ids = set(loads.keys())
+        for t in teachers:
+            if t["id"] not in assigned_ids:
+                rows.append({
+                    "Teacher": t.get("full_name", "?"),
+                    "Subjects Taught": t.get("subjects_taught", ""),
+                    "Classes": 0,
+                    "Periods/Week": 0,
+                    "Max": (t.get("max_periods_per_day") or 6) * 5,
+                    "Status": "⚠️ UNASSIGNED",
+                    "Breakdown": "",
+                })
+
+        return rows
+    except Exception as e:
+        st.error(f"Error building load report: {e}")
+        return []
+
 def get_all_streams_from_data():
     """Return list of streams from the current Excel data."""
     if st.session_state.get("data") is None:
@@ -1978,7 +2580,7 @@ def login_screen():
 
     left, center, right = st.columns([1, 1.4, 1])
     with center:
-        role = st.selectbox("Login as", ["Administrator", "Teacher", "Student", "Parent", "Clerk", "Exams Officer"])
+        role = st.selectbox("Login as", ["Administrator", "Teacher", "Student", "Parent", "Clerk", "Exams Officer", "IT Officer"])
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
 
@@ -1992,6 +2594,7 @@ def login_screen():
                     or (role == "Parent" and user["role"] == "parent")
                     or (role == "Clerk" and user["role"] == "clerk")
                     or (role == "Exams Officer" and user["role"] == "exams")
+                    or (role == "IT Officer" and user["role"] == "it_officer")
                 )
                 if not valid_role:
                     user = None
@@ -2126,10 +2729,13 @@ st.markdown(
 # NAVIGATION
 # ============================================================
 
-if st.session_state.user_role == "clerk":
+if st.session_state.user_role == "it_officer":
+    nav_items = ["Dashboard", "Change Password", "Settings"]
+elif st.session_state.user_role == "clerk":
     nav_items = ["💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Change Password"]
 elif st.session_state.user_role == "exams":
-    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "Settings"]
+    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "📊 Teacher Load Report", "Settings"]
+    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "Settings"]
 elif st.session_state.user_role == "student":
     nav_items = ["My Dashboard", "Learning Centre", "Online Tests & Quizzes", "My Profile", "Change Password"]
 elif st.session_state.user_role == "parent":
@@ -2137,7 +2743,7 @@ elif st.session_state.user_role == "parent":
 elif st.session_state.user_role == "teacher":
     nav_items = ["Dashboard", "Students", "Academic Results", "Streams", "Master Merit List", "Reports", "Learning Centre", "Online Tests & Quizzes", "Settings"]
 else:
-    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Settings"]
+    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "📊 Teacher Load Report", "💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Settings"]
 
 page = st.sidebar.radio("Navigation", nav_items)
 st.sidebar.caption(f"Signed in as: **{st.session_state.user_role.title()}**")
@@ -4500,10 +5106,247 @@ elif page == "📊 Fee Reports":
             use_container_width=True
         )
 
+# ============================================================
+# TIMETABLE PAGE
+# ============================================================
+
+# ============================================================
+# TEACHER LOAD REPORT
+# ============================================================
+
+elif page == "📊 Teacher Load Report":
+    if st.session_state.user_role not in ["admin", "exams"]:
+        st.error("🔒 You don't have access to this page.")
+        st.stop()
+
+    st.subheader("📊 Teacher Load Report")
+    st.caption("Shows each teacher's total periods/week. Any teacher above their max (30 typical) is overloaded.")
+
+    rows = tt_teacher_load_report()
+    if not rows:
+        st.warning("No data yet. Add teachers and assignments in Settings → ⚙️ Timetable Setup.")
+        st.stop()
+
+    total_periods = sum(r["Periods/Week"] for r in rows)
+    overloaded = [r for r in rows if "OVERLOADED" in r["Status"]]
+    unassigned = [r for r in rows if "UNASSIGNED" in r["Status"]]
+    assigned = [r for r in rows if "OK" in r["Status"]]
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Teachers Assigned", len(assigned))
+    c2.metric("Total Periods", total_periods)
+    c3.metric("Overloaded", len(overloaded))
+    c4.metric("Unassigned", len(unassigned))
+
+    if overloaded:
+        st.error(f"⚠️ **{len(overloaded)} teacher(s) are OVERLOADED**")
+    if unassigned:
+        st.warning(f"ℹ️ {len(unassigned)} teacher(s) have no classes yet.")
+
+    st.divider()
+    df = pd.DataFrame(rows)
+    st.dataframe(df, use_container_width=True, hide_index=True)
+
+    if overloaded:
+        st.divider()
+        st.markdown("### 🔴 Overloaded Teachers — Fix These")
+        for r in overloaded:
+            st.error(f"**{r['Teacher']}** — {r['Periods/Week']} periods vs {r['Max']} max. Subjects: {r['Breakdown']}")
+
+    st.stop()
+
+
+elif page == "📅 Timetable":
+    if st.session_state.user_role not in ["admin", "exams"]:
+        st.error("🔒 You don't have access to the timetable.")
+        st.stop()
+
+    st.subheader("📅 Timetable")
+    st.caption("Generate, view, and export the school timetable. Set up teachers and assignments first in Settings → ⚙️ Timetable Setup.")
+
+    teachers = tt_get_teachers()
+    subjects = tt_get_subjects()
+    all_classes = tt_get_all_classes()
+    assignments = tt_get_class_teacher_assignments()
+    periods, breaks = tt_get_periods()
+    generated_count = tt_count_generated()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Classes", len(all_classes))
+    c2.metric("Teachers", len(teachers))
+    c3.metric("Subjects", len(subjects))
+    c4.metric("Timetable Slots", generated_count)
+
+    st.divider()
+
+    if not teachers:
+        st.warning("⚠️ No teachers added yet. Go to **Settings → ⚙️ Timetable Setup** to add teachers first.")
+    elif not all_classes:
+        st.warning("⚠️ No classes found. Please check the Supabase tt_class_teacher table.")
+    else:
+        st.success(f"✅ Setup ready: {len(all_classes)} classes, {len(teachers)} teachers, {len(subjects)} subjects.")
+
+        st.markdown("### 🔄 Generate Timetable")
+        st.caption("Click the button below to generate the full weekly timetable. This may take 10–60 seconds.")
+
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            if st.button("🔄 Generate Timetable", type="primary", use_container_width=True, key="tt_generate_btn"):
+                with st.spinner("Solving the timetable — this may take up to 2 minutes..."):
+                    result = tt_generate_timetable(max_seconds=120)
+
+                if result["success"]:
+                    st.success(result["message"])
+                    st.rerun()
+                else:
+                    st.error(result["message"])
+        with col2:
+            generated_count = tt_count_generated()
+            if generated_count > 0:
+                st.metric("Slots", generated_count)
+
+        st.divider()
+
+        # ---------------- VIEWER ----------------
+        if generated_count == 0:
+            st.info("No timetable generated yet. Click **🔄 Generate Timetable** above to create one.")
+            st.stop()
+
+        st.markdown("## 📋 View Timetable")
+
+        teacher_map = {t["id"]: t["full_name"] for t in teachers}
+        view_mode = st.radio(
+            "View by",
+            ["By Class", "By Teacher", "By Room"],
+            horizontal=True,
+            key="tt_view_mode"
+        )
+
+        if view_mode == "By Class":
+            selected_class = st.selectbox("Select class", all_classes, key="tt_view_class")
+            rows = tt_get_generated(class_name=selected_class)
+            st.markdown(f"### {selected_class}")
+            if not rows:
+                st.warning("No schedule for this class.")
+            else:
+                df = tt_build_grid(rows, teacher_map)
+                st.dataframe(
+                    df.drop(columns=["_is_break"]),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=620,
+                )
+                col_dl1, col_dl2 = st.columns(2)
+                with col_dl1:
+                    pdf_buf = tt_generate_pdf(
+                        rows,
+                        f"CLASS TIMETABLE — {selected_class}",
+                        st.session_state.school_name,
+                        teacher_map,
+                    )
+                    st.download_button(
+                        "📄 Download as PDF",
+                        data=pdf_buf.getvalue(),
+                        file_name=f"Timetable_{selected_class.replace(' ', '_')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key=f"tt_pdf_{selected_class}",
+                    )
+                with col_dl2:
+                    csv = df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ Download as CSV",
+                        data=csv,
+                        file_name=f"Timetable_{selected_class.replace(' ', '_')}.csv",
+                        mime="text/csv",
+                        use_container_width=True,
+                        key=f"tt_csv_{selected_class}",
+                    )
+
+        elif view_mode == "By Teacher":
+            if not teachers:
+                st.warning("No teachers.")
+            else:
+                teacher_labels = {t["id"]: t["full_name"] for t in teachers}
+                teacher_choice = st.selectbox(
+                    "Select teacher",
+                    options=list(teacher_labels.keys()),
+                    format_func=lambda tid: teacher_labels[tid],
+                    key="tt_view_teacher",
+                )
+                rows = tt_get_generated(teacher_id=teacher_choice)
+                st.markdown(f"### {teacher_labels[teacher_choice]}")
+                if not rows:
+                    st.warning("No schedule for this teacher.")
+                else:
+                    grid_rows = []
+                    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+                    periods = [1, 2, 3, 4, 5, 6, 7, 8]
+                    matrix = {p: {d: "" for d in days} for p in periods}
+                    for r in rows:
+                        p = r["period_no"]
+                        d = r["day_of_week"]
+                        cl = r["class_name"]
+                        subj = r["subject_name"]
+                        room = r.get("room") or ""
+                        cell = f"{cl}\n{subj}"
+                        if room:
+                            cell += f"\n[{room}]"
+                        if p in matrix and d in matrix[p]:
+                            matrix[p][d] = cell
+                    df = pd.DataFrame(matrix).T
+                    df.index.name = "Period"
+                    df = df.reset_index()
+                    st.dataframe(df, use_container_width=True, hide_index=True, height=520)
+
+                    pdf_buf = tt_generate_pdf(
+                        rows,
+                        f"TEACHER TIMETABLE — {teacher_labels[teacher_choice]}",
+                        st.session_state.school_name,
+                        teacher_map,
+                    )
+                    st.download_button(
+                        "📄 Download as PDF",
+                        data=pdf_buf.getvalue(),
+                        file_name=f"Teacher_{teacher_labels[teacher_choice].replace(' ', '_')}.pdf",
+                        mime="application/pdf",
+                        use_container_width=True,
+                        key=f"tt_t_pdf_{teacher_choice}",
+                    )
+
+        else:  # By Room
+            rooms = ["Chemistry Lab", "Biology Lab", "Computer Lab"]
+            selected_room = st.selectbox("Select room", rooms, key="tt_view_room")
+            rows = tt_get_generated(room=selected_room)
+            st.markdown(f"### {selected_room}")
+            if not rows:
+                st.info(f"No scheduled periods in {selected_room}.")
+            else:
+                df = pd.DataFrame(rows)[["day_of_week", "period_no", "class_name", "subject_name", "teacher_id"]].copy()
+                df["teacher_name"] = df["teacher_id"].map(teacher_map).fillna("")
+                df = df[["day_of_week", "period_no", "class_name", "subject_name", "teacher_name"]]
+                df.columns = ["Day", "Period", "Class", "Subject", "Teacher"]
+                day_order = {"Monday": 1, "Tuesday": 2, "Wednesday": 3, "Thursday": 4, "Friday": 5}
+                df["_d"] = df["Day"].map(day_order)
+                df = df.sort_values(["_d", "Period"]).drop(columns=["_d"])
+                st.dataframe(df, use_container_width=True, hide_index=True)
+
+        st.divider()
+        st.markdown("### 📋 Class Assignments Overview")
+        if assignments:
+            df_assign = pd.DataFrame(assignments)
+            teacher_map2 = {t["id"]: t["full_name"] for t in teachers}
+            df_assign["teacher_name"] = df_assign["teacher_id"].map(teacher_map2).fillna("(unassigned)")
+            df_assign = df_assign[["class_name", "subject_name", "teacher_name", "periods_per_week"]]
+            df_assign.columns = ["Class", "Subject", "Teacher", "Periods / Week"]
+            with st.expander("Show all class assignments"):
+                st.dataframe(df_assign, use_container_width=True, hide_index=True)
+
+
 elif page == "Settings":
     st.subheader("School Profile & System Settings")
 
-    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_exams, tab_admins, tab_backup = st.tabs([
+    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_exams, tab_admins, tab_tt_setup, tab_ito, tab_backup, tab_health = st.tabs([
         "🏫 School Profile",
         "🔒 Change Password",
         "👨‍🏫 Teacher Accounts",
@@ -4513,7 +5356,10 @@ elif page == "Settings":
         "📄 Excel Format Guide",
         "🎓 Exams Officer Accounts",
         "🛡️ Admin Accounts",
-        "💾 Backup & Data"
+        "⚙️ Timetable Setup",
+        "🖥️ IT Officer Accounts",
+        "💾 Backup & Data",
+        "🖥️ System Health"
     ])
 
     # ============================================================
@@ -5005,6 +5851,137 @@ For **every term**, the app expects 3 types of columns:
                         st.info("No exams officers to delete.")
 
         # ============================================================
+        # ============================================================
+    # TAB 10: Timetable Setup
+    # ============================================================
+    with tab_tt_setup:
+        if st.session_state.user_role not in ["admin", "exams"]:
+            st.info("🔒 Only administrators and examination officers can set up the timetable.")
+        else:
+            st.subheader("⚙️ Timetable Setup")
+            st.caption("Add teachers and assign them to subjects per class. Once this is done, the timetable can be generated.")
+
+            setup_tab1, setup_tab2, setup_tab3 = st.tabs(["👨‍🏫 Teachers", "📚 Assignments", "🕐 Periods"])
+
+            # ---------- TAB A: Teachers ----------
+            with setup_tab1:
+                st.markdown("### Teachers")
+                teachers = tt_get_teachers()
+                if teachers:
+                    df_t = pd.DataFrame(teachers)
+                    df_t = df_t[["full_name", "subjects_taught", "max_periods_per_day"]]
+                    df_t.columns = ["Full Name", "Subjects Taught", "Max Periods/Day"]
+                    st.dataframe(df_t, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No teachers added yet. Add the first one below.")
+
+                st.divider()
+                st.markdown("### ➕ Add / Update Teacher")
+                t1, t2, t3 = st.columns([2, 2, 1])
+                with t1:
+                    new_teacher_name = st.text_input("Teacher full name", placeholder="e.g. Mr. Peter Kamau", key="tt_new_teacher_name")
+                with t2:
+                    new_teacher_subjects = st.text_input("Subjects taught", placeholder="e.g. Maths, Physics", key="tt_new_teacher_subjects")
+                with t3:
+                    new_teacher_max = st.number_input("Max periods/day", min_value=1, max_value=10, value=6, step=1, key="tt_new_teacher_max")
+
+                if st.button("➕ Save Teacher", type="primary", use_container_width=True, key="tt_save_teacher"):
+                    if not new_teacher_name.strip():
+                        st.error("Enter the teacher's name.")
+                    else:
+                        try:
+                            tt_create_or_update_teacher(new_teacher_name.strip(), new_teacher_subjects.strip(), new_teacher_max)
+                            st.success(f"Teacher '{new_teacher_name.strip()}' saved.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+
+                if teachers:
+                    with st.expander("🗑️ Delete a teacher"):
+                        del_opts = {f"{t['full_name']} ({t.get('subjects_taught','')})": t["id"] for t in teachers}
+                        del_label = st.selectbox("Select teacher to delete", list(del_opts.keys()), key="tt_del_teacher_select")
+                        confirm_del = st.checkbox("I understand this will remove the teacher.", key="tt_del_teacher_confirm")
+                        if st.button("Delete Teacher", type="secondary", disabled=not confirm_del, key="tt_del_teacher_btn"):
+                            try:
+                                tt_delete_teacher(del_opts[del_label])
+                                st.success("Deleted.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+
+            # ---------- TAB B: Assignments ----------
+            with setup_tab2:
+                st.markdown("### Class ↔ Subject ↔ Teacher")
+                st.caption("Assign a teacher to each subject for each class. Subject period counts come from the timetable master table.")
+
+                all_classes = tt_get_all_classes()
+                teachers = tt_get_teachers()
+
+                if not all_classes:
+                    st.warning("No classes found in the timetable master table.")
+                elif not teachers:
+                    st.warning("Add teachers first (👨‍🏫 Teachers tab).")
+                else:
+                    selected_class = st.selectbox("Select class", all_classes, key="tt_assign_class")
+                    st.markdown(f"#### {selected_class}")
+
+                    assignments = tt_get_class_teacher_assignments(selected_class)
+                    teacher_options = ["(unassigned)"] + [f"{t['full_name']}" for t in teachers]
+                    teacher_id_by_name = {f"{t['full_name']}": t["id"] for t in teachers}
+
+                    with st.form(key=f"tt_assign_form_{selected_class}"):
+                        pending = {}
+                        for a in assignments:
+                            c1, c2, c3 = st.columns([2, 2, 1])
+                            with c1:
+                                st.markdown(f"**{a['subject_name']}**")
+                            with c2:
+                                current_teacher = None
+                                if a.get("teacher_id"):
+                                    for t in teachers:
+                                        if t["id"] == a["teacher_id"]:
+                                            current_teacher = t["full_name"]
+                                            break
+                                idx = teacher_options.index(current_teacher) if current_teacher in teacher_options else 0
+                                sel = st.selectbox(
+                                    f"Teacher for {a['subject_name']}",
+                                    teacher_options,
+                                    index=idx,
+                                    key=f"tt_t_{selected_class}_{a['subject_name']}",
+                                    label_visibility="collapsed"
+                                )
+                                pending[a["subject_name"]] = sel
+                            with c3:
+                                st.caption(f"{a['periods_per_week']}p/w")
+
+                        submitted = st.form_submit_button("💾 Save All Assignments", type="primary", use_container_width=True)
+                        if submitted:
+                            try:
+                                for subj, sel in pending.items():
+                                    tid = teacher_id_by_name.get(sel) if sel != "(unassigned)" else None
+                                    ppw = next(a["periods_per_week"] for a in assignments if a["subject_name"] == subj)
+                                    tt_assign_teacher(selected_class, subj, tid, ppw)
+                                st.success(f"Saved assignments for {selected_class}.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+
+            # ---------- TAB C: Periods ----------
+            with setup_tab3:
+                st.markdown("### School Period Structure")
+                periods, breaks = tt_get_periods()
+                if periods:
+                    df_p = pd.DataFrame(periods)
+                    df_p = df_p[["period_no", "start_time", "end_time"]]
+                    df_p.columns = ["Period", "Start", "End"]
+                    st.dataframe(df_p, use_container_width=True, hide_index=True)
+                if breaks:
+                    df_b = pd.DataFrame(breaks)
+                    df_b = df_b[["break_label", "start_time", "end_time"]]
+                    df_b.columns = ["Break", "Start", "End"]
+                    st.dataframe(df_b, use_container_width=True, hide_index=True)
+                st.caption("Period times are set in the Supabase tt_periods table. Contact your developer to change them.")
+
     # TAB 9: Admin Accounts
     # ============================================================
     with tab_admins:
@@ -5097,15 +6074,206 @@ For **every term**, the app expects 3 types of columns:
                 except Exception:
                     st.info("No admins available to delete.")
 
+            # ============================================================
     # TAB 8: Backup & Data
     # ============================================================
     with tab_backup:
-        if st.session_state.user_role not in ["admin", "teacher", "exams"]:
-            st.info("🔒 Only administrators, teachers and examination officers can access Backup.")
+        if st.session_state.user_role not in ["admin", "teacher", "exams", "it_officer"]:
+            st.info("🔒 Only administrators, teachers, examination officers and IT officers can access Backup.")
         else:
             st.write("### Download a full backup")
             st.caption("ZIP with all cloud tables as JSON files.")
-            if st.button("Prepare Backup ZIP", type="primary", use_container_width=True):
+            
+
+            st.divider()
+            st.write("### Current data")
+            st.write(f"**File:** {st.session_state.raw_file_name or 'No file loaded'}")
+            if data is not None:
+                st.write(f"**Analysis term:** {data['analysis_term'].upper()}")
+                st.write(f"**Students:** {len(df)}")
+                st.write(f"**Streams:** {df[stream_col].nunique()}")
+
+            st.success("✅ All data is stored in Supabase — it persists across app restarts.")
+
+        # ============================================================
+    # TAB 11.5: IT Officer Accounts (admin-only)
+    # ============================================================
+    with tab_ito:
+        if st.session_state.user_role not in ["admin"]:
+            st.info("🔒 Only administrators can manage IT officer accounts.")
+        else:
+            st.subheader("🖥️ IT Officer Accounts")
+            st.caption("Create and manage IT officer accounts. IT Officers handle backups, system health and technical tasks.")
+
+            try:
+                ito_rows = supabase.table("users").select("username,student_name").eq("role", "it_officer").order("username").execute().data
+                if ito_rows:
+                    df_ito = pd.DataFrame(ito_rows)
+                    df_ito.columns = ["Username", "Full Name"]
+                    st.dataframe(df_ito, use_container_width=True, hide_index=True)
+                else:
+                    st.info("No IT officer accounts yet. Add the first one below.")
+            except Exception:
+                pass
+
+            st.divider()
+            st.markdown("### ➕ Create / Update IT Officer")
+
+            io1, io2 = st.columns(2)
+            with io1:
+                ito_username = st.text_input("IT Officer username", placeholder="e.g. it_officer", key="new_ito_username")
+                ito_full_name = st.text_input("IT Officer full name", placeholder="e.g. IT Officer", key="new_ito_full_name")
+            with io2:
+                ito_password = st.text_input("IT Officer password", type="password", key="new_ito_password")
+                st.caption("Password must be at least 6 characters.")
+
+            if st.button("➕ Create / Update IT Officer", type="primary", use_container_width=True, key="create_ito_btn"):
+                if not ito_username.strip() or not ito_full_name.strip() or not ito_password.strip():
+                    st.error("Enter username, full name and password.")
+                elif len(ito_password) < 6:
+                    st.error("Password must be at least 6 characters.")
+                else:
+                    try:
+                        hashed = hash_password(ito_password)
+                        existing = supabase.table("users").select("username").eq("username", ito_username.strip()).execute()
+                        if existing.data:
+                            supabase.table("users").update({
+                                "password": hashed,
+                                "role": "it_officer",
+                                "student_name": ito_full_name.strip()
+                            }).eq("username", ito_username.strip()).execute()
+                            st.success(f"✅ IT Officer '{ito_username.strip()}' updated — password reset.")
+                        else:
+                            supabase.table("users").insert({
+                                "username": ito_username.strip(),
+                                "password": hashed,
+                                "role": "it_officer",
+                                "student_name": ito_full_name.strip()
+                            }).execute()
+                            st.success(f"✅ IT Officer '{ito_username.strip()}' created.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
+            st.divider()
+            with st.expander("🗑️ Delete an IT officer"):
+                try:
+                    ito_list = supabase.table("users").select("username").eq("role", "it_officer").order("username").execute().data
+                    if ito_list:
+                        delete_options = [c["username"] for c in ito_list]
+                        selected_delete = st.selectbox("Select IT officer to delete", delete_options, key="delete_ito_select")
+                        confirm_del = st.checkbox("I understand this will remove the IT officer account.", key="confirm_delete_ito")
+                        if st.button("Delete IT Officer", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_ito_btn"):
+                            try:
+                                supabase.table("users").delete().eq("username", selected_delete).eq("role", "it_officer").execute()
+                                st.success(f"Deleted {selected_delete}.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+                    else:
+                        st.info("No IT officers to delete.")
+                except Exception:
+                    st.info("No IT officers to delete.")
+
+    
+
+    # ============================================================
+    # TAB 12: System Health (IT Officer)
+    # ============================================================
+    with tab_health:
+        if st.session_state.user_role not in ["admin", "it_officer"]:
+            st.info("🔒 Only administrators and IT officers can view system health.")
+        else:
+            st.subheader("🖥️ System Health")
+            st.caption("Real-time status of the Academic Management System.")
+
+            h1, h2, h3 = st.columns(3)
+
+            try:
+                supabase.table("users").select("username").limit(1).execute()
+                db_status = "🟢 Online"
+                db_ok = True
+            except Exception:
+                db_status = "🔴 Offline"
+                db_ok = False
+
+            h1.metric("Database (Supabase)", db_status)
+            h2.metric("App", "🟢 Running")
+            h3.metric("Session Time", datetime.now().strftime("%H:%M"))
+
+            st.divider()
+            st.markdown("### 📊 Data Counts")
+
+            def count(table_name):
+                try:
+                    r = supabase.table(table_name).select("id").execute()
+                    return len(r.data or [])
+                except Exception:
+                    return "—"
+
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Total Users", count("users"))
+            c2.metric("Students", count("students"))
+            c3.metric("Parents", count("parents"))
+            c4.metric("Materials", count("materials"))
+
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("Submissions", count("submissions"))
+            c6.metric("Quizzes", count("quizzes"))
+            c7.metric("Quiz Attempts", count("quiz_attempts"))
+            c8.metric("Fee Payments", count("fee_payments"))
+
+            st.divider()
+            st.markdown("### 👥 Users by Role")
+            try:
+                users = supabase.table("users").select("role").execute().data or []
+                role_counts = {}
+                for u in users:
+                    r = u.get("role", "unknown")
+                    role_counts[r] = role_counts.get(r, 0) + 1
+                df_roles = pd.DataFrame([
+                    {"Role": k.replace("_", " ").title(), "Count": v} for k, v in sorted(role_counts.items())
+                ])
+                st.dataframe(df_roles, use_container_width=True, hide_index=True)
+            except Exception:
+                st.info("Could not load user roles.")
+
+            st.divider()
+            st.markdown("### 🔧 Quick Actions")
+
+            qa1, qa2 = st.columns(2)
+            with qa1:
+                if st.button("🔄 Refresh Status", use_container_width=True, key="health_refresh"):
+                    st.rerun()
+            with qa2:
+                if st.button("📥 Quick Backup", type="primary", use_container_width=True, key="health_backup"):
+                    with st.spinner("Packaging backup..."):
+                        backup = create_backup_zip()
+                    st.download_button(
+                        "⬇️ Download Backup ZIP",
+                        data=backup.getvalue(),
+                        file_name=f"Academic_Backup_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                        key="health_backup_dl"
+                    )
+
+            st.divider()
+            st.markdown("### 📖 System Info")
+            st.write(f"**App Version:** V20")
+            st.write(f"**Signed in as:** {st.session_state.username} ({st.session_state.user_role.title()})")
+            st.write(f"**School:** {st.session_state.school_name}")
+            st.write(f"**Academic Year:** {st.session_state.get('academic_year', '')}")
+            st.write(f"**Current Term:** {st.session_state.get('current_term', '')}")
+
+            if db_ok:
+                st.success("✅ All systems operational.")
+            else:
+                st.error("⚠️ Database is unreachable. Contact the developer immediately.")
+
+            st.write("### Download a full backup")
+            st.caption("ZIP with all cloud tables as JSON files.")
+            if st.button("Prepare Backup ZIP", type="primary", use_container_width=True, key="backup_prepare_btn"):
                 with st.spinner("Packaging backup..."):
                     backup = create_backup_zip()
                 st.download_button(
