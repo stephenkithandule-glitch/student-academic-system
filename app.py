@@ -4503,7 +4503,7 @@ elif page == "📊 Fee Reports":
 elif page == "Settings":
     st.subheader("School Profile & System Settings")
 
-    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_exams, tab_backup = st.tabs([
+    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_exams, tab_admins, tab_backup = st.tabs([
         "🏫 School Profile",
         "🔒 Change Password",
         "👨‍🏫 Teacher Accounts",
@@ -4512,6 +4512,7 @@ elif page == "Settings":
         "🎓 Student Accounts",
         "📄 Excel Format Guide",
         "🎓 Exams Officer Accounts",
+        "🛡️ Admin Accounts",
         "💾 Backup & Data"
     ])
 
@@ -5002,6 +5003,99 @@ For **every term**, the app expects 3 types of columns:
                             st.info("No exams officers to delete.")
                     except Exception:
                         st.info("No exams officers to delete.")
+
+        # ============================================================
+    # TAB 9: Admin Accounts
+    # ============================================================
+    with tab_admins:
+        if st.session_state.user_role not in ["admin"]:
+            st.info("🔒 Only administrators can manage admin accounts.")
+        else:
+            st.caption("Create and manage administrator accounts. Admins can reset each other's passwords here — critical for emergency recovery.")
+            try:
+                admin_rows = supabase.table("users").select("username,student_name").eq("role", "admin").order("username").execute().data
+                if admin_rows:
+                    df_admins = pd.DataFrame(admin_rows)
+                    df_admins.columns = ["Username", "Full Name"]
+                    st.dataframe(df_admins, use_container_width=True, hide_index=True)
+            except Exception:
+                pass
+
+            st.divider()
+            st.markdown("### ➕ Create / Update Admin")
+            st.caption("If the username already exists, this resets that admin's password and name. If new, this creates a new admin.")
+
+            ad1, ad2 = st.columns(2)
+            with ad1:
+                admin_username = st.text_input("Admin username", placeholder="e.g. admin or backup_admin", key="new_admin_username")
+                admin_full_name = st.text_input("Admin full name", placeholder="e.g. Principal or Backup Administrator", key="new_admin_full_name")
+            with ad2:
+                admin_password = st.text_input("Admin password", type="password", key="new_admin_password")
+                st.caption("Password must be at least 6 characters. **Leave blank** if you only want to update the full name.")
+
+            st.warning("⚠️ Only reset passwords you are authorized to reset. Every reset is permanent.")
+
+            if st.button("➕ Create / Update Admin", type="primary", use_container_width=True, key="create_admin_btn"):
+                if not admin_username.strip():
+                    st.error("Enter the username.")
+                elif not admin_full_name.strip():
+                    st.error("Enter the full name.")
+                else:
+                    try:
+                        existing = supabase.table("users").select("username").eq("username", admin_username.strip()).execute()
+                        if existing.data:
+                            update_payload = {
+                                "role": "admin",
+                                "student_name": admin_full_name.strip()
+                            }
+                            if admin_password.strip():
+                                if len(admin_password) < 6:
+                                    st.error("Password must be at least 6 characters.")
+                                    st.stop()
+                                update_payload["password"] = hash_password(admin_password)
+                            supabase.table("users").update(update_payload).eq("username", admin_username.strip()).execute()
+                            if admin_password.strip():
+                                st.success(f"✅ Admin '{admin_username.strip()}' updated — password reset.")
+                            else:
+                                st.success(f"✅ Admin '{admin_username.strip()}' updated — name changed, password unchanged.")
+                        else:
+                            if not admin_password.strip():
+                                st.error("Password is required when creating a NEW admin.")
+                                st.stop()
+                            if len(admin_password) < 6:
+                                st.error("Password must be at least 6 characters.")
+                                st.stop()
+                            supabase.table("users").insert({
+                                "username": admin_username.strip(),
+                                "password": hash_password(admin_password),
+                                "role": "admin",
+                                "student_name": admin_full_name.strip()
+                            }).execute()
+                            st.success(f"✅ Admin '{admin_username.strip()}' created.")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Error: {e}")
+
+            st.divider()
+            with st.expander("🗑️ Delete an admin account"):
+                st.caption("⚠️ You cannot delete the account you are currently logged in with.")
+                try:
+                    admin_list = supabase.table("users").select("username").eq("role", "admin").order("username").execute().data
+                    deletable = [a["username"] for a in admin_list if a["username"] != st.session_state.username] if admin_list else []
+                    if deletable:
+                        selected_delete = st.selectbox("Select admin to delete", deletable, key="delete_admin_select")
+                        confirm_del = st.checkbox("I understand this will permanently remove this admin account.", key="confirm_delete_admin")
+                        if st.button("Delete Admin", type="secondary", disabled=not confirm_del, use_container_width=True, key="delete_admin_btn"):
+                            try:
+                                supabase.table("users").delete().eq("username", selected_delete).eq("role", "admin").execute()
+                                st.success(f"Deleted {selected_delete}.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+                    else:
+                        st.info("No other admin accounts to delete (you can't delete the account you're logged in with).")
+                except Exception:
+                    st.info("No admins available to delete.")
 
     # TAB 8: Backup & Data
     # ============================================================
