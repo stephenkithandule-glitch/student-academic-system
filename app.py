@@ -1003,6 +1003,156 @@ def tt_get_periods():
     except Exception:
         return [], []
 
+def tt_create_period(period_no, start_time, end_time):
+    """Insert a new period (teaching or break)."""
+    existing = supabase.table("tt_periods").select("id").eq("period_no", period_no).execute()
+    payload = {
+        "period_no": int(period_no),
+        "start_time": start_time.strip(),
+        "end_time": end_time.strip(),
+        "is_break": False,
+        "break_label": None,
+    }
+    if existing.data:
+        supabase.table("tt_periods").update(payload).eq("id", existing.data[0]["id"]).execute()
+    else:
+        supabase.table("tt_periods").insert(payload).execute()
+
+
+def tt_create_break(break_label, start_time, end_time):
+    """Insert a new break."""
+    existing = supabase.table("tt_periods").select("period_no").lt("period_no", 0).execute()
+    used = [p["period_no"] for p in (existing.data or [])]
+    next_id = min(used + [0]) - 1 if used else -1
+    supabase.table("tt_periods").insert({
+        "period_no": next_id,
+        "start_time": start_time.strip(),
+        "end_time": end_time.strip(),
+        "is_break": True,
+        "break_label": break_label.strip(),
+    }).execute()
+
+
+def tt_update_period(period_id, start_time, end_time, break_label=None):
+    """Update time on an existing period or break."""
+    payload = {"start_time": start_time.strip(), "end_time": end_time.strip()}
+    if break_label is not None:
+        payload["break_label"] = break_label.strip()
+    supabase.table("tt_periods").update(payload).eq("id", period_id).execute()
+
+
+def tt_delete_period(period_id):
+    """Delete a period or break."""
+    supabase.table("tt_periods").delete().eq("id", period_id).execute()
+
+
+def tt_get_all_periods():
+    """Return ALL periods AND breaks, sorted for display."""
+    try:
+        result = supabase.table("tt_periods").select("*").execute()
+        rows = result.data or []
+        return rows
+    except Exception:
+        return []
+
+def tt_create_or_update_subject(subject_name, periods_per_week, has_double, double_count, requires_lab, lab_type):
+    """Insert or update a subject. Also auto-assigns (unassigned) rows for all classes."""
+    existing = supabase.table("tt_subjects").select("id").eq("subject_name", subject_name.strip()).execute()
+    payload = {
+        "subject_name": subject_name.strip(),
+        "periods_per_week": int(periods_per_week),
+        "has_double": bool(has_double),
+        "double_count": int(double_count) if has_double else 0,
+        "requires_lab": bool(requires_lab),
+        "lab_type": (lab_type or "").strip() if requires_lab else None,
+    }
+    is_new = not existing.data
+    if existing.data:
+        supabase.table("tt_subjects").update(payload).eq("id", existing.data[0]["id"]).execute()
+    else:
+        supabase.table("tt_subjects").insert(payload).execute()
+
+    # Auto-create assignment rows for all existing classes
+    all_classes = set()
+    try:
+        rows = supabase.table("tt_class_teacher").select("class_name").execute().data or []
+        all_classes = set(r["class_name"] for r in rows)
+    except Exception:
+        all_classes = set()
+
+    for cls in sorted(all_classes):
+        try:
+            existing_a = supabase.table("tt_class_teacher").select("id").eq("class_name", cls).eq("subject_name", subject_name.strip()).execute()
+            if not existing_a.data:
+                supabase.table("tt_class_teacher").insert({
+                    "class_name": cls,
+                    "subject_name": subject_name.strip(),
+                    "teacher_id": None,
+                    "periods_per_week": int(periods_per_week),
+                }).execute()
+            else:
+                # Update periods_per_week to keep in sync
+                supabase.table("tt_class_teacher").update({
+                    "periods_per_week": int(periods_per_week),
+                }).eq("id", existing_a.data[0]["id"]).execute()
+        except Exception:
+            pass
+
+    return True
+
+
+
+def tt_delete_subject(subject_id):
+    """Delete a subject."""
+    supabase.table("tt_subjects").delete().eq("id", subject_id).execute()
+
+
+def tt_get_all_subjects():
+    """Return all subjects sorted by name."""
+    try:
+        result = supabase.table("tt_subjects").select("*").order("subject_name").execute()
+        return result.data or []
+    except Exception:
+        return []
+
+def tt_create_class(class_name):
+    """Create a new class and auto-add rows for every existing subject."""
+    class_name = class_name.strip().upper()
+    if not class_name:
+        return False
+
+    # Add assignment rows for every existing subject
+    try:
+        subjects = supabase.table("tt_subjects").select("subject_name,periods_per_week").execute().data or []
+        for s in subjects:
+            existing = supabase.table("tt_class_teacher").select("id").eq("class_name", class_name).eq("subject_name", s["subject_name"]).execute()
+            if not existing.data:
+                supabase.table("tt_class_teacher").insert({
+                    "class_name": class_name,
+                    "subject_name": s["subject_name"],
+                    "teacher_id": None,
+                    "periods_per_week": int(s["periods_per_week"] or 0),
+                }).execute()
+    except Exception:
+        pass
+    return True
+
+
+def tt_delete_class(class_name):
+    """Delete a class and all its assignment rows."""
+    supabase.table("tt_class_teacher").delete().eq("class_name", class_name).execute()
+    # Also delete any generated timetable slots for that class
+    try:
+        supabase.table("tt_generated").delete().eq("class_name", class_name).execute()
+    except Exception:
+        pass
+
+
+
+
+
+
+
 
 def tt_get_subjects():
     """Return all subjects with their period rules."""
@@ -1091,7 +1241,7 @@ def tt_count_generated():
     except Exception:
         return 0
 
-def tt_generate_timetable(max_seconds=120):
+def tt_generate_timetable(max_seconds=300):
     """
     Generate a complete timetable using Google OR-Tools.
     Writes results to the tt_generated table.
@@ -1108,7 +1258,7 @@ def tt_generate_timetable(max_seconds=120):
     if not teachers or not subjects or not assignments:
         return {"success": False, "message": "Missing setup data — add teachers/subjects/assignments first."}
 
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    days = st.session_state.get("teaching_days") or ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
     period_nos = sorted([p["period_no"] for p in periods])
     all_classes = sorted(set(a["class_name"] for a in assignments))
 
@@ -1141,8 +1291,33 @@ def tt_generate_timetable(max_seconds=120):
     for c in all_classes:
         for di in range(len(days)):
             for pi in range(len(period_nos)):
-                model.Add(sum(x[(c, s, di, pi)] for s in subject_by_name.keys() if (c, s, di, pi) in x) == 1)
+                                model.Add(sum(x[(c, s, di, pi)] for s in subject_by_name.keys() if (c, s, di, pi) in x) <= 1)
+    # Constraint 1b: each class's subjects must total its own weekly target
+    # (the sum of its own subjects' periods_per_week)
+    class_target = {}
+    for d in demand:
+        c = d["class"]
+        class_target[c] = class_target.get(c, 0) + int(d["ppw"])
 
+    max_slots = len(days) * len(period_nos)
+    for c in all_classes:
+        if class_target.get(c, 0) > max_slots:
+            return {
+                "success": False,
+                "message": (
+                    f"Class **{c}** needs {class_target[c]} periods/week but only "
+                    f"{max_slots} slots are available "
+                    f"({len(days)} days × {len(period_nos)} periods/day). "
+                    f"Reduce its subjects or add more periods to the day."
+                ),
+                "stats": {},
+            }
+        class_vars = [x[(c, s, di, pi)]
+                      for s in subject_by_name.keys()
+                      for di in range(len(days))
+                      for pi in range(len(period_nos))
+                      if (c, s, di, pi) in x]
+        model.Add(sum(class_vars) == class_target.get(c, 0))
     # Constraint 2: subject meets its weekly period count per class
     for d in demand:
         c = d["class"]
@@ -1272,7 +1447,7 @@ def tt_get_generated(class_name=None, teacher_id=None, room=None):
 
 def tt_build_grid(rows, teacher_map):
     """Turn a list of timetable rows into a week grid DataFrame with break rows."""
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    days = st.session_state.get("teaching_days") or ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 
     # Get periods + breaks with times
     periods, breaks = tt_get_periods()
@@ -1420,7 +1595,7 @@ def tt_generate_pdf(rows, title, school_name, teacher_map):
     period_time = {p["period_no"]: f"{p.get('start_time','')} – {p.get('end_time','')}".strip(" –") for p in periods}
     break_list = sorted(breaks, key=lambda b: b.get("start_time") or "")
 
-    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+    days = st.session_state.get("teaching_days") or ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
 
     matrix = {p: {d: None for d in days} for p in period_nos}
     for r in rows:
@@ -1589,6 +1764,267 @@ def tt_teacher_load_report():
     except Exception as e:
         st.error(f"Error building load report: {e}")
         return []
+        # ============================================================
+# TIMETABLE ADVISOR HELPERS
+# ============================================================
+
+def tt_advisor_analyse(teachers, classes, assignments, subjects):
+    """
+    Analyse whether a timetable setup is feasible.
+
+    Rules (Level 2 — flexible):
+      - Periods/day comes from the DB (tt_periods, is_break=False).
+      - Teaching days come from st.session_state.teaching_days.
+      - A class is OK if its total subject periods <= days*periods_per_day.
+      - Under-filling is a WARNING (empty slots), not a blocker.
+      - Over-filling is a blocker.
+      - Teacher overload is a blocker.
+      - Unassigned non-exempt subjects are a blocker (only if teachers exist).
+    """
+    issues = []
+    warnings = []
+    notes = []
+
+    teacher_by_id = {t.get("id"): t for t in teachers if t.get("id") is not None}
+
+    # ---- Dynamic days/periods ----
+    days = st.session_state.get("teaching_days") or [
+        "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"
+    ]
+    try:
+        periods_rows = (
+            supabase.table("tt_periods")
+            .select("period_no")
+            .eq("is_break", False)
+            .execute()
+            .data
+            or []
+        )
+        num_periods = len(periods_rows)
+    except Exception:
+        num_periods = 8
+    max_slots = len(days) * num_periods
+
+    # ---- 1. Per-class totals ----
+    class_totals = {}
+    for a in assignments:
+        cls = a.get("class_name")
+        ppw = int(a.get("periods_per_week") or 0)
+        class_totals[cls] = class_totals.get(cls, 0) + ppw
+
+    for cls, total in class_totals.items():
+        if total > max_slots:
+            issues.append(
+                f"**{cls}** has **{total} periods/week** — that exceeds the "
+                f"**{max_slots}** slots available "
+                f"({len(days)} days × {num_periods} periods/day)."
+            )
+        elif total < max_slots:
+            warnings.append(
+                f"**{cls}** has **{total} periods/week** — "
+                f"**{max_slots - total}** slot(s) will be left empty."
+            )
+
+    # ---- 2. Teacher loads ----
+    teacher_loads = {}
+    teacher_subjects = {}
+    teacher_classes = {}
+    for a in assignments:
+        tid = a.get("teacher_id")
+        if tid is None:
+            continue
+        ppw = int(a.get("periods_per_week") or 0)
+        teacher_loads[tid] = teacher_loads.get(tid, 0) + ppw
+        teacher_subjects.setdefault(tid, set()).add(a.get("subject_name"))
+        teacher_classes.setdefault(tid, set()).add(a.get("class_name"))
+
+    for tid, load in teacher_loads.items():
+        t = teacher_by_id.get(tid, {})
+        max_pd = int(t.get("max_periods_per_day") or 6)
+        max_pw = max_pd * len(days)
+        name = t.get("full_name", "?")
+        if load > max_pw:
+            issues.append(
+                f"**{name}** is overloaded: **{load} periods/week** "
+                f"vs max **{max_pw}**."
+            )
+        elif load >= max_pw - 2:
+            warnings.append(
+                f"**{name}** is near capacity: **{load}/{max_pw}** periods/week."
+            )
+
+    # ---- 3. Unassigned teachers ----
+    assigned_ids = set(teacher_loads.keys())
+    for t in teachers:
+        tid = t.get("id")
+        if tid is not None and tid not in assigned_ids:
+            warnings.append(f"**{t.get('full_name','?')}** has no classes assigned.")
+
+    # ---- 4. Unassigned subjects (only if teachers exist at all) ----
+    exempt = {"Free Study", "Assembly"}
+    if teachers:
+        unassigned_subjects = set()
+        for a in assignments:
+            if a.get("teacher_id") is None and a.get("subject_name") not in exempt:
+                unassigned_subjects.add(a.get("subject_name"))
+        if unassigned_subjects:
+            issues.append(
+                "Subjects without a teacher: **"
+                + ", ".join(sorted(unassigned_subjects))
+                + "**. Assign teachers to every subject "
+                "(except Free Study & Assembly)."
+            )
+
+    # ---- 5. Aggregate capacity vs demand ----
+    total_demand = sum(teacher_loads.values())
+    total_capacity = sum(
+        int(t.get("max_periods_per_day") or 6) * len(days) for t in teachers
+    )
+    if teachers and total_capacity < total_demand:
+        issues.append(
+            f"Total teacher capacity is **{total_capacity} periods/week** "
+            f"but total demand is **{total_demand}**. "
+            f"Add more teachers or reduce subjects."
+        )
+
+    notes.append(
+        f"**{len(classes)} classes** × up to **{max_slots} slots/week** "
+        f"= up to **{len(classes) * max_slots} slots/week** total."
+    )
+    notes.append(
+        f"**{len(teachers)} teachers** provide **{total_capacity} periods/week** of capacity."
+    )
+    if total_demand:
+        notes.append(f"**{total_demand} periods/week** currently assigned.")
+    notes.append(
+        f"Slot math: **{len(days)} days × {num_periods} periods/day = {max_slots} slots/week per class**."
+    )
+
+    ok = len(issues) == 0
+    return {
+        "ok": ok,
+        "issues": issues,
+        "warnings": warnings,
+        "notes": notes,
+        "stats": {
+            "classes": len(classes),
+            "teachers": len(teachers),
+            "total_demand": total_demand,
+            "total_capacity": total_capacity,
+            "max_slots": max_slots,
+            "required_per_class": max_slots,
+            "num_periods": num_periods,
+            "num_days": len(days),
+            "class_totals": class_totals,
+            "teacher_loads": {
+                tid: {
+                    "name": teacher_by_id.get(tid, {}).get("full_name", "?"),
+                    "load": load,
+                    "max": int(teacher_by_id.get(tid, {}).get("max_periods_per_day") or 6) * len(days),
+                    "subjects": sorted(teacher_subjects.get(tid, [])),
+                    "classes": sorted(teacher_classes.get(tid, [])),
+                }
+                for tid, load in teacher_loads.items()
+            },
+        },
+    }
+
+def tt_advisor_render_report(result):
+    """Render the advisor analysis result in Streamlit."""
+    if result.get("ok"):
+        if result.get("warnings"):
+            st.warning(
+                f"⚠️ **This setup will generate, but with {len(result['warnings'])} warning(s).** "
+                f"Review the warnings below."
+            )
+        else:
+            st.success("✅ **This setup looks feasible!** You can proceed to generate.")
+    else:
+        st.error(
+            f"❌ **This setup will NOT generate a timetable.** "
+            f"Found **{len(result['issues'])}** blocking issue(s)."
+        )
+
+    if result.get("issues"):
+        st.markdown("### 🚫 Blocking Issues")
+        for issue in result["issues"]:
+            st.markdown(f"- {issue}")
+
+    if result.get("warnings"):
+        st.markdown("### ⚠️ Warnings")
+        for w in result["warnings"]:
+            st.markdown(f"- {w}")
+
+    if result.get("notes"):
+        st.markdown("### 📝 Notes")
+        for n in result["notes"]:
+            st.markdown(f"- {n}")
+
+    stats = result.get("stats", {})
+    class_totals = stats.get("class_totals", {})
+    max_slots = stats.get("max_slots", 40)
+
+    if class_totals:
+        st.markdown("### 📋 Periods per Class")
+        rows = []
+        for cls, total in sorted(class_totals.items()):
+            empty = max(0, max_slots - total)
+            if total > max_slots:
+                status = f"❌ +{total - max_slots} over"
+            elif empty > 0:
+                status = f"⚠️ {empty} empty"
+            else:
+                status = "✅ Full"
+            rows.append({
+                "Class": cls,
+                "Periods/Week": total,
+                "Max Slots": max_slots,
+                "Empty Slots": empty,
+                "Status": status,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    teacher_loads = stats.get("teacher_loads", {})
+    if teacher_loads:
+        st.markdown("### 👨‍🏫 Teacher Load Summary")
+        rows = []
+        for tid, info in sorted(teacher_loads.items(), key=lambda x: -x[1]["load"]):
+            if info["load"] > info["max"]:
+                status = "❌ OVERLOADED"
+            elif info["load"] >= info["max"] - 2:
+                status = "⚠️ Near max"
+            else:
+                status = "✅ OK"
+            rows.append({
+                "Teacher": info["name"],
+                "Periods/Week": info["load"],
+                "Max": info["max"],
+                "Classes": len(info["classes"]),
+                "Subjects": ", ".join(info["subjects"]),
+                "Status": status,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    # ---- Per-teacher load table ----
+    teacher_loads = result.get("stats", {}).get("teacher_loads", {})
+    if teacher_loads:
+        st.markdown("### 👨‍🏫 Teacher Load Summary")
+        rows = []
+        for tid, info in sorted(teacher_loads.items(), key=lambda x: -x[1]["load"]):
+            status = "✅ OK"
+            if info["load"] > info["max"]:
+                status = "❌ OVERLOADED"
+            elif info["load"] >= info["max"] - 2:
+                status = "⚠️ Near max"
+            rows.append({
+                "Teacher": info["name"],
+                "Periods/Week": info["load"],
+                "Max": info["max"],
+                "Classes": len(info["classes"]),
+                "Subjects": ", ".join(info["subjects"]),
+                "Status": status,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 def get_all_streams_from_data():
     """Return list of streams from the current Excel data."""
@@ -2556,6 +2992,8 @@ defaults = {
     "username": "",
     "student_name": "",
     "active_quiz": None,
+        "active_quiz": None,
+    "teaching_days": ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"],
 }
 for key, value in defaults.items():
     if key not in st.session_state:
@@ -2730,23 +3168,24 @@ st.markdown(
 # ============================================================
 
 if st.session_state.user_role == "it_officer":
-    nav_items = ["Dashboard", "Change Password", "Settings"]
+    nav_items = ["Dashboard", "📅 Timetable", "🤖 Timetable Advisor", "📊 Teacher Load Report", "Change Password", "Settings", "❓ Help & Guides"]
 elif st.session_state.user_role == "clerk":
-    nav_items = ["💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Change Password"]
+    nav_items = ["💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Change Password", "❓ Help & Guides"]
 elif st.session_state.user_role == "exams":
-    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "📊 Teacher Load Report", "Settings"]
-    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "Settings"]
+    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "🤖 Timetable Advisor", "📊 Teacher Load Report", "Settings", "❓ Help & Guides"]
 elif st.session_state.user_role == "student":
-    nav_items = ["My Dashboard", "Learning Centre", "Online Tests & Quizzes", "My Profile", "Change Password"]
+    nav_items = ["My Dashboard", "Learning Centre", "Online Tests & Quizzes", "My Profile", "Change Password", "❓ Help & Guides"]
 elif st.session_state.user_role == "parent":
-    nav_items = ["Parent Portal", "Change Password"]
+    nav_items = ["Parent Portal", "Change Password", "❓ Help & Guides"]
 elif st.session_state.user_role == "teacher":
-    nav_items = ["Dashboard", "Students", "Academic Results", "Streams", "Master Merit List", "Reports", "Learning Centre", "Online Tests & Quizzes", "Settings"]
+    nav_items = ["Dashboard", "Students", "Academic Results", "Streams", "Master Merit List", "Reports", "Learning Centre", "Online Tests & Quizzes", "Settings", "❓ Help & Guides"]
 else:
-    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "📊 Teacher Load Report", "💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Settings"]
+    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "🤖 Timetable Advisor", "📊 Teacher Load Report", "💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Settings", "❓ Help & Guides"]
 
 page = st.sidebar.radio("Navigation", nav_items)
 st.sidebar.caption(f"Signed in as: **{st.session_state.user_role.title()}**")
+
+
 
 if st.sidebar.button("Sign out", use_container_width=True):
     st.session_state.logged_in = False
@@ -5115,7 +5554,7 @@ elif page == "📊 Fee Reports":
 # ============================================================
 
 elif page == "📊 Teacher Load Report":
-    if st.session_state.user_role not in ["admin", "exams"]:
+    if st.session_state.user_role not in ["admin", "exams", "it_officer"]:
         st.error("🔒 You don't have access to this page.")
         st.stop()
 
@@ -5156,13 +5595,133 @@ elif page == "📊 Teacher Load Report":
     st.stop()
 
 
-elif page == "📅 Timetable":
-    if st.session_state.user_role not in ["admin", "exams"]:
-        st.error("🔒 You don't have access to the timetable.")
-        st.stop()
+# ============================================================
+# HELP & GUIDES PAGE
+# ============================================================
 
-    st.subheader("📅 Timetable")
-    st.caption("Generate, view, and export the school timetable. Set up teachers and assignments first in Settings → ⚙️ Timetable Setup.")
+
+    st.markdown("""
+### 🎯 The Golden Rule
+**Every class must have exactly 40 periods of subjects per week** — or fewer (Free Study fills the rest).
+
+The system runs on:
+- **8 teaching periods/day**
+- **5 days/week** (Mon–Fri)
+- **8 × 5 = 40 slots per class per week**
+
+If the total periods for a class exceed 40, the generator will fail with **INFEASIBLE**.
+
+---
+
+### 📋 Step-by-Step Setup
+
+#### Step 1 — Add Teachers
+**Settings → ⚙️ Timetable Setup → 👨‍🏫 Teachers**
+
+Add every teacher with:
+- Full name (e.g., "Mr. Peter Kamau")
+- Subjects they teach (e.g., "Maths, Physics")
+- Max periods per day (default 6 → max 30/week)
+
+⚠️ **Watch the load:** A teacher can only teach ~30 periods/week. If they're overloaded, generation fails.
+
+#### Step 2 — Add Subjects
+**Settings → ⚙️ Timetable Setup → 📖 Subjects**
+
+Add every subject the school teaches. For each:
+- Subject name (e.g., "Music")
+- Periods per week (e.g., 2)
+- Has a double period? (for Chemistry, Biology)
+- Requires a lab? (Chemistry Lab, Biology Lab, Computer Lab)
+
+⚠️ **When you add a new subject**, it will appear in every class. You MUST reduce Free Study (or another subject) by the same number of periods to keep totals at 40.
+
+#### Step 3 — Add Classes
+**Settings → ⚙️ Timetable Setup → 🏫 Classes**
+
+Add every class:
+- Format: `FORM 1 EAST`, `FORM 1 WEST`, `FORM 2 EAST`, ...
+
+Adding a class auto-creates rows for every existing subject.
+
+#### Step 4 — Assign Teachers
+**Settings → ⚙️ Timetable Setup → 📚 Assignments**
+
+For each class:
+- Select the class from dropdown
+- For every subject, pick the teacher who teaches it
+- Leave **Free Study** and **Assembly** as `(unassigned)`
+- Click **💾 Save All Assignments**
+
+⚠️ **Every subject must have a teacher** except Free Study and Assembly.
+
+#### Step 5 — Check Teacher Load
+**📊 Teacher Load Report** (sidebar)
+
+Verify:
+- ✅ 0 Overloaded teachers
+- ✅ 0 Unassigned teachers
+- ✅ Total Periods looks right
+
+If anyone is overloaded → reassign some classes to another teacher.
+
+#### Step 6 — Generate
+**📅 Timetable → 🔄 Generate Timetable**
+
+Wait 10–60 seconds. Success → 40 slots × number of classes.
+
+---
+
+### 🧮 How Many Teachers Does a School Need?
+
+| Classes | Periods/Slot Total | Teachers Needed |
+|---|---|---|
+| 6 | 240 | ~10–12 |
+| 12 | 480 | ~16–20 |
+| 16 | 640 | ~24–28 |
+| 20 | 800 | ~30–35 |
+| 24 | 960 | ~36–42 |
+
+**Rule of thumb:** Teachers = Classes × 2 (approximately).
+
+---
+
+### ⚠️ Common Mistakes
+
+**❌ Adding a subject without reducing Free Study**
+- A class at 40 periods gets +2 for Music → 42 → INFEASIBLE
+- **Fix:** Reduce Free Study from 5 → 3 for that class
+
+**❌ Assigning a teacher to too many classes**
+- One teacher can't teach 40 periods/week
+- **Fix:** Split across multiple teachers
+
+**❌ Leaving a subject unassigned**
+- If a subject has no teacher, generator fails
+- **Fix:** Assign every subject except Free Study + Assembly
+
+**❌ Forgetting to Save**
+- After picking teachers in Assignments, you must click **💾 Save All Assignments**
+- **Fix:** Always verify the green "Saved" message appears
+
+---
+
+### 🔧 If Generation Fails with INFEASIBLE
+
+**Step 1 — Check Teacher Load**
+- 📊 Teacher Load Report
+- Look for red "OVERLOADED" rows
+- Reassign some classes
+
+**Step 2 — Check Class Period Count**
+Run this in Supabase:
+```sql
+SELECT class_name, SUM(periods_per_week) AS total
+FROM tt_class_teacher
+GROUP BY class_name
+HAVING SUM(periods_per_week) != 40;
+        """)
+elif page == "📅 Timetable":
 
     teachers = tt_get_teachers()
     subjects = tt_get_subjects()
@@ -5193,7 +5752,7 @@ elif page == "📅 Timetable":
         with col1:
             if st.button("🔄 Generate Timetable", type="primary", use_container_width=True, key="tt_generate_btn"):
                 with st.spinner("Solving the timetable — this may take up to 2 minutes..."):
-                    result = tt_generate_timetable(max_seconds=120)
+                    result = tt_generate_timetable(max_seconds=300)
 
                 if result["success"]:
                     st.success(result["message"])
@@ -5280,7 +5839,7 @@ elif page == "📅 Timetable":
                     st.warning("No schedule for this teacher.")
                 else:
                     grid_rows = []
-                    days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
+                    days = st.session_state.get("teaching_days") or ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
                     periods = [1, 2, 3, 4, 5, 6, 7, 8]
                     matrix = {p: {d: "" for d in days} for p in periods}
                     for r in rows:
@@ -5343,6 +5902,682 @@ elif page == "📅 Timetable":
                 st.dataframe(df_assign, use_container_width=True, hide_index=True)
 
 
+# ============================================================
+# HELP & GUIDES PAGE (role-restricted)
+# ============================================================
+
+elif page == "❓ Help & Guides":
+    st.subheader("❓ Help & Guides")
+    st.caption("Step-by-step guides for your role in the Academic Management System.")
+
+    role = st.session_state.get("user_role", "")
+
+    # ---------------- ADMIN ----------------
+    if role == "admin":
+        t1, t2, t3, t4, t5, t6, t7 = st.tabs([
+            "🚀 Getting Started",
+            "📅 Timetable Setup",
+            "💰 Fee Setup",
+            "🎓 Academic Results",
+            "👥 Account Management",
+            "📊 Reports & Exports",
+            "🔧 Troubleshooting",
+        ])
+
+        with t1:
+            st.markdown("""
+### Welcome, Administrator
+
+You have full access to the entire system. This is what you can do:
+
+- Manage student records
+- Enter and edit academic results
+- Generate report cards and merit lists
+- Set up fee structure and record payments
+- Manage all user accounts (teachers, clerks, parents, students, exams officers, IT officers, other admins)
+- Configure timetables
+- Monitor system health and backups
+
+---
+
+### 🚀 First-Time Setup
+
+1. **School Profile** — Settings → 🏫 School Profile → add name, logo, address, motto
+2. **Upload Excel** — sidebar → Upload student_results.xlsx
+3. **Fee Structure** — Settings → 💰 Fee Structure → set term fees
+4. **Timetable** — Settings → ⚙️ Timetable Setup → add teachers, subjects, classes
+5. **User Accounts** — Settings → create accounts for staff, parents, students
+
+---
+
+### ✅ Daily Workflow
+
+- **Check Dashboard** for school metrics
+- **Review reports** — Master Merit List, Analytics
+- **Manage accounts** — add/remove staff, reset passwords
+- **Monitor** — check 📊 Teacher Load Report weekly
+            """)
+
+        with t2:
+            st.markdown("""
+### 📅 Timetable Setup (Admin)
+
+**Every class must have exactly 40 periods of subjects per week.**
+
+- 8 periods/day × 5 days = 40 slots
+- Exceeding 40 → generator fails with INFEASIBLE
+
+---
+
+### Steps
+
+1. **Add teachers** — Settings → ⚙️ Timetable Setup → 👨‍🏫 Teachers
+2. **Add subjects** — Settings → ⚙️ Timetable Setup → 📖 Subjects
+3. **Add classes** — Settings → ⚙️ Timetable Setup → 🏫 Classes
+4. **Assign teachers** — Settings → ⚙️ Timetable Setup → 📚 Assignments
+5. **Check load** — 📊 Teacher Load Report
+6. **Generate** — 📅 Timetable → 🔄 Generate Timetable
+
+---
+
+### Rule of thumb
+
+| Classes | Teachers needed |
+|---|---|
+| 12 | ~20 |
+| 16 | ~28 |
+| 20 | ~35 |
+
+**Teachers ≈ Classes × 2**
+            """)
+
+        with t3:
+            st.markdown("""
+### 💰 Fee Setup (Admin)
+
+**Setup:**
+- Settings → 💰 Fee Structure → set per stream + term
+
+**Recording payments:**
+- Sidebar → 💵 Record Payment → select student, amount, method
+
+**Reports:**
+- Sidebar → 📊 Fee Reports → collection totals, defaulters, outstanding
+- Sidebar → 📒 Student Ledger → per-student history
+
+**Defaulters:**
+- 📊 Fee Reports → Fee Default Report → set threshold → download CSV or PDF
+            """)
+
+        with t4:
+            st.markdown("""
+### 🎓 Academic Results (Admin)
+
+**Enter results:**
+- Sidebar → Academic Results → select term + student → enter marks
+
+**Report cards:**
+- Sidebar → Students → select student → Download PDF
+- Sidebar → Reports → Generate ALL Student PDFs (ZIP)
+
+**Merit lists:**
+- Sidebar → Master Merit List → view rankings → download PDF
+
+**Excel upload:**
+- Sidebar → Upload student_results.xlsx → choose term → Load
+            """)
+
+        with t5:
+            st.markdown("""
+### 👥 Account Management (Admin)
+
+All accounts created via **Settings → [Role] Accounts**:
+
+- 👨‍🏫 Teacher Accounts
+- 💼 Clerk Accounts
+- 👨‍👩‍👧 Parent Accounts
+- 🎓 Student Accounts
+- 🎓 Exams Officer Accounts
+- 🛡️ Admin Accounts
+- 🖥️ IT Officer Accounts
+
+**Reset a forgotten password:** open the appropriate tab, enter username + new password, save.
+
+**Delete a departed staff member:** open the tab → Delete expander → select → confirm.
+            """)
+
+        with t6:
+            st.markdown("""
+### 📊 Reports & Exports (Admin)
+
+| Report | Where | Format |
+|---|---|---|
+| Master Merit | Master Merit List | PDF |
+| All Report Cards | Reports | ZIP |
+| Individual Report | Students | PDF |
+| Fee Report | 📊 Fee Reports | CSV |
+| Fee Defaulters | 📊 Fee Reports | CSV + PDF |
+| Receipt | 💵 Record Payment | PDF |
+| Statement | 📒 Student Ledger | CSV |
+| Class Timetable | 📅 Timetable | PDF + CSV |
+| Teacher Timetable | 📅 Timetable | PDF |
+| Full Backup | 💾 Backup & Data | ZIP |
+
+**Weekly:** download Backup ZIP → save to Google Drive
+            """)
+
+        with t7:
+            st.markdown("""
+### 🔧 Troubleshooting (Admin)
+
+**App won't load** → refresh, wait 60s, check internet
+
+**Login fails** → check role, reset password in Settings
+
+**Timetable INFEASIBLE** → check 📊 Teacher Load Report, ensure every class = 40 periods
+
+**Excel upload fails** → check Settings → 📄 Excel Format Guide for correct columns
+
+**Database errors** → check Settings → 🖥️ System Health
+
+---
+
+### 📞 Contact Developer
+
+**Stephen Kithandule**
+- 📱 0759120553
+- ✉️ stephenkithandule@gmail.com
+            """)
+
+    # ---------------- EXAMS OFFICER ----------------
+    elif role == "exams":
+        t1, t2, t3, t4, t5 = st.tabs([
+            "🚀 Getting Started",
+            "📅 Timetable Setup",
+            "🎓 Academic Results",
+            "📊 Reports & Exports",
+            "🔧 Troubleshooting",
+        ])
+
+        with t1:
+            st.markdown("""
+### Welcome, Exams Officer
+
+Your role covers academic administration and timetables:
+
+- Enter and edit academic results
+- Manage student records
+- Set up and generate timetables
+- Create student and parent accounts
+- View reports and merit lists
+
+**You do NOT see:** Fee pages, teacher/clerk account management, school profile.
+            """)
+
+        with t2:
+            st.markdown("""
+### 📅 Timetable Setup (Exams Officer)
+
+**Golden rule:** Every class must total exactly 40 periods/week.
+
+**Setup:** Settings → ⚙️ Timetable Setup (4 sub-tabs)
+- Teachers, Subjects, Classes, Assignments
+
+**Check load:** 📊 Teacher Load Report
+
+**Generate:** 📅 Timetable → 🔄 Generate Timetable
+            """)
+
+        with t3:
+            st.markdown("""
+### 🎓 Academic Results (Exams Officer)
+
+- Sidebar → Academic Results → enter/edit marks
+- Sidebar → Students → write class teacher comments, download report cards
+- Sidebar → Master Merit List → ranked lists + PDF export
+            """)
+
+        with t4:
+            st.markdown("""
+### 📊 Reports (Exams Officer)
+
+- Master Merit List PDF
+- All student report cards (ZIP)
+- Individual report cards
+- Class / Teacher timetables (PDF)
+            """)
+
+        with t5:
+            st.markdown("""
+### 🔧 Troubleshooting (Exams Officer)
+
+- **Timetable fails** → check Teacher Load, check class totals = 40
+- **Excel upload** → check column format
+- **Contact:** Stephen Kithandule · 0759120553
+            """)
+
+    # ---------------- TEACHER ----------------
+    elif role == "teacher":
+        t1, t2, t3 = st.tabs([
+            "🚀 Getting Started",
+            "🎓 Entering Marks",
+            "🔧 Troubleshooting",
+        ])
+
+        with t1:
+            st.markdown("""
+### Welcome, Teacher
+
+Your role:
+- Enter and edit academic marks for your classes
+- View student profiles and reports
+- Post materials and quizzes in Learning Centre
+
+**You do NOT see:** Fee pages, account management, system settings.
+            """)
+
+        with t2:
+            st.markdown("""
+### 🎓 How to Enter Marks
+
+1. Sidebar → **Academic Results**
+2. Select **term** (e.g. Y2T2)
+3. Select **student**
+4. Enter marks for each subject
+5. Click **💾 Save Academic Results**
+
+Marks save to the cloud automatically. The student's average, grade, and rank update instantly.
+            """)
+
+        with t3:
+            st.markdown("""
+### 🔧 Troubleshooting (Teacher)
+
+- **Login fails** → check role + password, ask admin to reset
+- **App slow** → refresh browser
+- **Marks not saving** → check internet, try again
+- **Need help** → contact the school administrator
+            """)
+
+    # ---------------- CLERK ----------------
+    elif role == "clerk":
+        t1, t2, t3 = st.tabs([
+            "🚀 Getting Started",
+            "💰 Recording Fees",
+            "🔧 Troubleshooting",
+        ])
+
+        with t1:
+            st.markdown("""
+### Welcome, Clerk
+
+Your role is fee management:
+- Set fee structure per stream + term
+- Record payments from students
+- Print receipts
+- View fee reports and defaulters
+
+**You do NOT see:** Academic pages, timetable, account management.
+            """)
+
+        with t2:
+            st.markdown("""
+### 💰 How to Record Fees
+
+**Setup fee structure first:**
+- Sidebar → 💰 Fee Structure → select stream + term + amount → Save
+
+**Record a payment:**
+1. Sidebar → 💵 Record Payment
+2. Select student
+3. Enter amount, date, method, reference
+4. Click **💾 Record Payment**
+5. Download the receipt PDF
+
+**View reports:**
+- 📒 Student Ledger → per-student history
+- 📊 Fee Reports → totals, defaulters, outstanding
+            """)
+
+        with t3:
+            st.markdown("""
+### 🔧 Troubleshooting (Clerk)
+
+- **Login fails** → ask admin to reset
+- **Student not found** → ensure Excel file is uploaded
+- **Need help** → contact the administrator or developer
+            """)
+
+    # ---------------- IT OFFICER ----------------
+    elif role == "it_officer":
+        t1, t2, t3, t4 = st.tabs([
+            "🚀 Getting Started",
+            "📅 Timetable Setup",
+            "🖥️ System Health",
+            "🔧 Troubleshooting",
+        ])
+
+        with t1:
+            st.markdown("""
+### Welcome, IT Officer
+
+Your role is technical:
+- Manage timetable setup and generation
+- Monitor system health
+- Download backups
+- Restart the app if needed
+
+**You do NOT see:** Fee pages, academic marks entry, account management.
+            """)
+
+        with t2:
+            st.markdown("""
+### 📅 Timetable (IT Officer)
+
+**Setup:** Settings → ⚙️ Timetable Setup (all sub-tabs)
+
+**Check load:** 📊 Teacher Load Report
+
+**Generate:** 📅 Timetable → 🔄 Generate Timetable
+
+**Export:** per-class, per-teacher PDFs
+            """)
+
+        with t3:
+            st.markdown("""
+### 🖥️ System Health (IT Officer)
+
+Settings → 🖥️ System Health shows:
+- Database status (🟢 Online / 🔴 Offline)
+- User counts by role
+- Data table counts
+- Quick backup button
+
+**If DB shows 🔴 Offline** → check internet → contact developer immediately.
+            """)
+
+        with t4:
+            st.markdown("""
+### 🔧 Troubleshooting (IT Officer)
+
+**App won't start** → refresh, wait 60s, check internet
+
+**Timetable fails** → check 📊 Teacher Load Report, verify every class totals 40 periods
+
+**DB offline** → contact developer
+
+**Backup failing** → check storage space
+
+**📞 Developer:** Stephen Kithandule · 0759120553 · stephenkithandule@gmail.com
+            """)
+
+    # ---------------- STUDENT ----------------
+    elif role == "student":
+        st.markdown("### 👋 Welcome, Student")
+        st.info("This guide shows how to view your own academic information. You cannot see other students' data or school management pages.")
+
+        st.markdown("""
+### 🎓 What You Can Do
+
+1. **My Dashboard** — see your average, grade, and rank
+2. **Learning Centre** — view assignments and submit work
+3. **Online Tests & Quizzes** — take quizzes set by teachers
+4. **My Profile** — view your account details
+5. **Change Password** — update your login password
+
+---
+
+### 📄 Viewing Your Report Card
+
+1. Sidebar → **My Dashboard**
+2. Click **⬇️ Download My Report Card (PDF)**
+3. Save or print
+
+Your report card shows:
+- Subject scores
+- Grades
+- Stream position
+- School position
+- Term-by-term progression
+
+---
+
+### 📝 Submitting Assignments
+
+1. Sidebar → **Learning Centre**
+2. Find the assignment
+3. Upload your file
+4. Click **📤 Submit Work**
+
+---
+
+### 🔐 Forgot Your Password?
+
+Ask your **class teacher** or the **school administrator** to reset it. Your password cannot be reset by yourself.
+
+---
+
+### 📞 Need Help?
+
+Contact the school office or your class teacher.
+            """)
+
+    # ---------------- PARENT ----------------
+    elif role == "parent":
+        st.markdown("### 👋 Welcome, Parent / Guardian")
+        st.info("This guide shows how to view your child's progress and fee status. You can only see your own child's information.")
+
+        st.markdown("""
+### 👨‍👩‍👧 What You Can Do
+
+1. **Parent Portal** — view your child's academic progress
+2. **Fee Status** — check fee balance and payment history
+3. **Report Card** — download your child's official report card
+4. **Change Password** — update your login password
+
+---
+
+### 📄 Viewing Your Child's Report Card
+
+1. Sidebar → **Parent Portal**
+2. If you have multiple children, select the child
+3. Click **⬇️ Download Report Card (PDF)**
+
+Your child's report shows:
+- Subject scores and grades
+- Stream mean comparison
+- Position in class and school
+- Charts of progression
+
+---
+
+### 💰 Checking Fee Balance
+
+1. Sidebar → **Parent Portal**
+2. Scroll to **💰 Fee Status**
+3. See term fee, amount paid, balance
+
+---
+
+### 🔐 Forgot Your Password?
+
+Contact the **school office** or the **bursar** to reset your password.
+
+---
+
+### 📞 Need Help?
+
+Contact the school office directly. Do not share your password with anyone.
+            """)
+
+    # ---------------- FALLBACK ----------------
+    else:
+        st.info("Help is not available for your account type. Please contact the school administrator.")
+# ============================================================
+# TIMETABLE ADVISOR PAGE
+# ============================================================
+
+elif page == "🤖 Timetable Advisor":
+    if st.session_state.user_role not in ["admin", "exams", "it_officer"]:
+        st.error("🔒 You don't have access to the Timetable Advisor.")
+        st.stop()
+
+    st.subheader("🤖 Timetable Advisor")
+    st.caption("Analyse whether your current or proposed timetable setup is feasible — before you waste time generating.")
+
+    advisor_tab1, advisor_tab2 = st.tabs(["🔍 Analyse Current Setup", "🎯 Simulate Custom Setup"])
+
+    # ============================================================
+    # TAB 1 — Analyse Current Setup
+    # ============================================================
+    with advisor_tab1:
+        st.markdown("### Analyse My Current Timetable Setup")
+        st.caption("Reads teachers, classes, and subject assignments from the cloud and tells you if the setup can produce a timetable.")
+
+        if st.button("🔍 Analyse Current Setup", type="primary", use_container_width=True, key="advisor_analyse_current"):
+            teachers = tt_get_teachers()
+            assignments = tt_get_class_teacher_assignments()
+            subjects = tt_get_subjects()
+            classes = tt_get_all_classes()
+
+            if not teachers:
+                st.error("No teachers found. Add teachers first in Settings → ⚙️ Timetable Setup → 👨‍🏫 Teachers.")
+            elif not assignments:
+                st.error("No class-subject assignments found. Set them up in Settings → ⚙️ Timetable Setup → 📚 Assignments.")
+            else:
+                result = tt_advisor_analyse(teachers, classes, assignments, subjects)
+                result["teachers"] = teachers
+                result["classes"] = classes
+
+                st.divider()
+                st.markdown("### 📋 Analysis Result")
+                tt_advisor_render_report(result)
+
+                st.divider()
+                st.markdown("### 👨‍🏫 Individual Teacher Loads")
+                loads = tt_teacher_load_report()
+                if loads:
+                    df_loads = pd.DataFrame(loads)
+                    st.dataframe(df_loads, use_container_width=True, hide_index=True)
+
+    # ============================================================
+    # TAB 2 — Simulate Custom Setup
+    # ============================================================
+    with advisor_tab2:
+        st.markdown("### Simulate a Custom Setup")
+        st.caption("Enter teachers and classes manually to test a hypothetical setup. Nothing is saved to the cloud.")
+
+        st.markdown("#### Step 1 — Enter Teachers")
+        st.caption("One teacher per line: `Name | Subjects | Max periods per day`")
+
+        teachers_text = st.text_area(
+            "Teachers",
+            height=180,
+            key="advisor_sim_teachers",
+            value="""Mr. Kamau | Maths, Physics | 6
+Ms. Wanjiku | English, Kiswahili | 6
+Mr. Otieno | Biology, Chemistry | 6"""
+        )
+
+        st.markdown("#### Step 2 — Enter Classes")
+        st.caption("One class per line: `Class Name | Required periods per week` (usually 40)")
+
+        classes_text = st.text_area(
+            "Classes",
+            height=120,
+            key="advisor_sim_classes",
+            value="""FORM 1 EAST | 40
+FORM 1 WEST | 40
+FORM 2 EAST | 40"""
+        )
+
+        st.markdown("#### Step 3 — Subject Periods Per Week Per Class")
+        st.caption("One subject per line: `Subject | Periods per class per week`")
+
+        subjects_text = st.text_area(
+            "Subjects",
+            height=200,
+            key="advisor_sim_subjects",
+            value="""Maths | 4
+English | 4
+Kiswahili | 3
+Biology | 3
+Chemistry | 3
+Physics | 3
+History | 2
+Geography | 2
+CRE/IRE | 2
+Business | 2
+Agriculture | 2
+Computer | 2
+PE | 1
+Assembly | 2
+Free Study | 3"""
+        )
+
+        if st.button("🎯 Simulate This Setup", type="primary", use_container_width=True, key="advisor_simulate"):
+            sim_teachers = []
+            for line in teachers_text.strip().split("\n"):
+                if "|" not in line:
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) < 3:
+                    continue
+                try:
+                    max_pd = int(parts[2])
+                except Exception:
+                    max_pd = 6
+                sim_teachers.append({
+                    "full_name": parts[0],
+                    "subjects_taught": parts[1],
+                    "max_periods_per_day": max_pd,
+                })
+
+            sim_classes = []
+            for line in classes_text.strip().split("\n"):
+                if "|" not in line:
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                if not parts:
+                    continue
+                sim_classes.append(parts[0])
+
+            sim_subjects_map = {}
+            for line in subjects_text.strip().split("\n"):
+                if "|" not in line:
+                    continue
+                parts = [p.strip() for p in line.split("|")]
+                if len(parts) < 2:
+                    continue
+                try:
+                    sim_subjects_map[parts[0]] = int(parts[1])
+                except Exception:
+                    pass
+
+            sim_assignments = []
+            for cls in sim_classes:
+                for subj, ppw in sim_subjects_map.items():
+                    sim_assignments.append({
+                        "class_name": cls,
+                        "subject_name": subj,
+                        "periods_per_week": ppw,
+                    })
+
+            if not sim_teachers or not sim_classes or not sim_assignments:
+                st.error("Please fill in teachers, classes, and subjects properly.")
+            else:
+                result = tt_advisor_analyse(sim_teachers, sim_classes, sim_assignments, [])
+                result["teachers"] = sim_teachers
+                result["classes"] = sim_classes
+
+                st.divider()
+                st.markdown("### 📋 Simulation Result")
+                tt_advisor_render_report(result)
+                st.caption("ℹ️ This is a simulation only. Nothing was saved to the database.")
+
+    st.stop()
+
+
 elif page == "Settings":
     st.subheader("School Profile & System Settings")
 
@@ -5389,6 +6624,14 @@ elif page == "Settings":
                     index=["Term 1", "Term 2", "Term 3"].index(st.session_state.current_term)
                     if st.session_state.current_term in ["Term 1", "Term 2", "Term 3"] else 2,
                     disabled=not is_admin
+                )
+                all_days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                teaching_days = st.multiselect(
+                    "Teaching days",
+                    all_days,
+                    default=st.session_state.get("teaching_days", all_days[:5]),
+                    disabled=not is_admin,
+                    help="Select the days your school teaches. Normally Mon–Fri."
                 )
                 if is_admin:
                     logo = st.file_uploader("School logo", type=["png", "jpg", "jpeg"], key="school_logo_upload")
@@ -5696,7 +6939,7 @@ elif page == "Settings":
         st.markdown("""
 | Column name | Example | Notes |
 |---|---|---|
-| `name` | JOHN MWANGI | Student's full name — must match parent/student account links |
+| `name` | JOHN MWANGI | Student full name - must match parent/student account links |
 | `stream` | FORM 2 EAST | Class / stream |
 | `admission number` | 1234 | Student ID (optional but recommended) |
 """)
@@ -5715,7 +6958,7 @@ For **every term**, the app expects 3 types of columns:
 - `y1t1` = Year 1, Term 1
 - `y2t3` = Year 2, Term 3
 - `y3t1` = Year 3, Term 1 (auto-detected!)
-""")
+        """)
 
         st.markdown("### 3️⃣ Example header row")
         st.code(
@@ -5855,13 +7098,13 @@ For **every term**, the app expects 3 types of columns:
     # TAB 10: Timetable Setup
     # ============================================================
     with tab_tt_setup:
-        if st.session_state.user_role not in ["admin", "exams"]:
-            st.info("🔒 Only administrators and examination officers can set up the timetable.")
+        if st.session_state.user_role not in ["admin", "exams", "it_officer"]:
+            st.info("🔒 Only administrators, examination officers and IT officers can set up the timetable.")
         else:
             st.subheader("⚙️ Timetable Setup")
             st.caption("Add teachers and assign them to subjects per class. Once this is done, the timetable can be generated.")
 
-            setup_tab1, setup_tab2, setup_tab3 = st.tabs(["👨‍🏫 Teachers", "📚 Assignments", "🕐 Periods"])
+            setup_tab1, setup_tab2, setup_tab3, setup_tab4, setup_tab5 = st.tabs(["👨‍🏫 Teachers", "📚 Assignments", "🕐 Periods", "📖 Subjects", "🏫 Classes"])
 
             # ---------- TAB A: Teachers ----------
             with setup_tab1:
@@ -5968,19 +7211,224 @@ For **every term**, the app expects 3 types of columns:
 
             # ---------- TAB C: Periods ----------
             with setup_tab3:
-                st.markdown("### School Period Structure")
-                periods, breaks = tt_get_periods()
-                if periods:
-                    df_p = pd.DataFrame(periods)
-                    df_p = df_p[["period_no", "start_time", "end_time"]]
-                    df_p.columns = ["Period", "Start", "End"]
-                    st.dataframe(df_p, use_container_width=True, hide_index=True)
-                if breaks:
-                    df_b = pd.DataFrame(breaks)
-                    df_b = df_b[["break_label", "start_time", "end_time"]]
-                    df_b.columns = ["Break", "Start", "End"]
-                    st.dataframe(df_b, use_container_width=True, hide_index=True)
-                st.caption("Period times are set in the Supabase tt_periods table. Contact your developer to change them.")
+                st.markdown("### 🕐 School Period Structure")
+                st.caption("View and edit the school's daily period times. Breaks are automatically shown between periods in the timetable.")
+
+                all_periods = tt_get_all_periods()
+                teaching_periods = sorted([p for p in all_periods if not p.get("is_break")], key=lambda x: x["period_no"])
+                break_periods = sorted([p for p in all_periods if p.get("is_break")], key=lambda x: x.get("start_time") or "")
+
+                st.markdown("#### 📚 Teaching Periods")
+                if teaching_periods:
+                    for p in teaching_periods:
+                        c1, c2, c3, c4, c5 = st.columns([1, 2, 2, 1, 1])
+                        with c1:
+                            st.markdown(f"**P{p['period_no']}**")
+                        with c2:
+                            new_start = st.text_input(f"Start (P{p['period_no']})", value=p.get("start_time", ""), key=f"tt_start_{p['id']}", label_visibility="collapsed")
+                        with c3:
+                            new_end = st.text_input(f"End (P{p['period_no']})", value=p.get("end_time", ""), key=f"tt_end_{p['id']}", label_visibility="collapsed")
+                        with c4:
+                            if st.button("💾", key=f"tt_save_{p['id']}", help="Save time"):
+                                try:
+                                    tt_update_period(p["id"], new_start, new_end)
+                                    st.success(f"P{p['period_no']} updated.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                        with c5:
+                            if st.button("🗑️", key=f"tt_del_{p['id']}", help="Delete period"):
+                                try:
+                                    tt_delete_period(p["id"])
+                                    st.success(f"P{p['period_no']} deleted.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                else:
+                    st.info("No teaching periods configured.")
+
+                st.markdown("#### ☕ Breaks")
+                if break_periods:
+                    for b in break_periods:
+                        c1, c2, c3, c4, c5 = st.columns([2, 2, 2, 1, 1])
+                        with c1:
+                            new_label = st.text_input(f"Label {b['id']}", value=b.get("break_label", ""), key=f"tt_blabel_{b['id']}", label_visibility="collapsed")
+                        with c2:
+                            new_bstart = st.text_input(f"B-Start {b['id']}", value=b.get("start_time", ""), key=f"tt_bstart_{b['id']}", label_visibility="collapsed")
+                        with c3:
+                            new_bend = st.text_input(f"B-End {b['id']}", value=b.get("end_time", ""), key=f"tt_bend_{b['id']}", label_visibility="collapsed")
+                        with c4:
+                            if st.button("💾", key=f"tt_bsave_{b['id']}", help="Save break"):
+                                try:
+                                    tt_update_period(b["id"], new_bstart, new_bend, new_label)
+                                    st.success(f"Break updated.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                        with c5:
+                            if st.button("🗑️", key=f"tt_bdel_{b['id']}", help="Delete break"):
+                                try:
+                                    tt_delete_period(b["id"])
+                                    st.success("Break deleted.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                else:
+                    st.info("No breaks configured.")
+
+                st.divider()
+                st.markdown("#### ➕ Add a Teaching Period")
+
+                max_p = max([p["period_no"] for p in teaching_periods], default=0)
+                add1, add2, add3, add4 = st.columns([1, 2, 2, 1])
+                with add1:
+                    new_p_no = st.number_input("Period #", min_value=1, max_value=20, value=max_p + 1, step=1, key="tt_new_p_no")
+                with add2:
+                    new_p_start = st.text_input("Start time", placeholder="e.g. 08:00", key="tt_new_p_start")
+                with add3:
+                    new_p_end = st.text_input("End time", placeholder="e.g. 08:45", key="tt_new_p_end")
+                with add4:
+                    if st.button("➕ Add", type="primary", key="tt_add_period_btn", use_container_width=True):
+                        if not new_p_start.strip() or not new_p_end.strip():
+                            st.error("Enter start and end times.")
+                        else:
+                            try:
+                                tt_create_period(new_p_no, new_p_start, new_p_end)
+                                st.success(f"P{new_p_no} added.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+
+                st.divider()
+                st.markdown("#### ➕ Add a Break")
+
+                b1, b2, b3, b4 = st.columns([2, 2, 2, 1])
+                with b1:
+                    new_b_label = st.text_input("Break label", placeholder="e.g. Morning Break", key="tt_new_b_label")
+                with b2:
+                    new_b_start = st.text_input("Start time", placeholder="e.g. 10:15", key="tt_new_b_start")
+                with b3:
+                    new_b_end = st.text_input("End time", placeholder="e.g. 10:35", key="tt_new_b_end")
+                with b4:
+                    if st.button("➕ Add", type="primary", key="tt_add_break_btn", use_container_width=True):
+                        if not new_b_label.strip() or not new_b_start.strip() or not new_b_end.strip():
+                            st.error("Fill in all fields.")
+                        else:
+                            try:
+                                tt_create_break(new_b_label, new_b_start, new_b_end)
+                                st.success("Break added.")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Error: {e}")
+
+                st.info("ℹ️ After changing periods or breaks, regenerate the timetable to apply the new structure.")
+                            # ---------- TAB D: Subjects ----------
+            with setup_tab4:
+                st.markdown("### 📖 Subjects")
+                st.caption("Manage subjects taught at the school. Each subject has a weekly period count and optional double-period rules.")
+
+                subjects = tt_get_all_subjects()
+                if subjects:
+                    st.markdown("#### Current Subjects")
+                    for s in subjects:
+                        c1, c2, c3, c4, c5, c6 = st.columns([2, 1, 1, 1, 2, 1])
+                        with c1:
+                            st.markdown(f"**{s['subject_name']}**")
+                        with c2:
+                            st.markdown(f"{s.get('periods_per_week', 0)} p/w")
+                        with c3:
+                            st.markdown("🔁 double" if s.get("has_double") else "—")
+                        with c4:
+                            st.markdown("🔬 lab" if s.get("requires_lab") else "—")
+                        with c5:
+                            st.caption(s.get("lab_type") or "")
+                        with c6:
+                            if st.button("🗑️", key=f"tt_del_subj_{s['id']}", help="Delete subject"):
+                                try:
+                                    tt_delete_subject(s["id"])
+                                    st.success(f"Deleted {s['subject_name']}.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                else:
+                    st.info("No subjects yet. Add one below.")
+
+                st.divider()
+                st.markdown("#### ➕ Add / Update Subject")
+
+                s1, s2 = st.columns(2)
+                with s1:
+                    subj_name = st.text_input("Subject name", placeholder="e.g. Music", key="tt_new_subj_name")
+                    subj_ppw = st.number_input("Periods per week", min_value=1, max_value=15, value=3, step=1, key="tt_new_subj_ppw")
+                with s2:
+                    subj_has_double = st.checkbox("Has a double period?", key="tt_new_subj_hasdouble")
+                    subj_double_count = st.number_input("Number of doubles", min_value=0, max_value=5, value=1 if subj_has_double else 0, step=1, key="tt_new_subj_dcount")
+
+                subj_lab = st.checkbox("Requires a lab or specific room?", key="tt_new_subj_lab")
+                subj_lab_type = ""
+                if subj_lab:
+                    subj_lab_type = st.text_input("Lab / room name", placeholder="e.g. Chemistry Lab", key="tt_new_subj_labtype")
+
+                if st.button("➕ Save Subject", type="primary", use_container_width=True, key="tt_save_subject_btn"):
+                    if not subj_name.strip():
+                        st.error("Enter a subject name.")
+                    else:
+                        try:
+                            tt_create_or_update_subject(
+                                subj_name.strip(),
+                                subj_ppw,
+                                subj_has_double,
+                                subj_double_count,
+                                subj_lab,
+                                subj_lab_type,
+                            )
+                            st.success(f"Subject '{subj_name.strip()}' saved.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+
+                st.info("ℹ️ Adding a subject here does NOT auto-assign teachers. After adding, go to the 📚 Assignments tab to assign teachers to this subject for each class.")
+                            # ---------- TAB E: Classes ----------
+            with setup_tab5:
+                st.markdown("### 🏫 Classes")
+                st.caption("Manage the school's classes. Adding a class automatically creates unassigned subject rows for it.")
+
+                classes = tt_get_all_classes()
+                if classes:
+                    st.markdown("#### Current Classes")
+                    for c in classes:
+                        c1, c2 = st.columns([4, 1])
+                        with c1:
+                            st.markdown(f"**{c}**")
+                        with c2:
+                            if st.button("🗑️", key=f"tt_del_class_{c}", help="Delete class"):
+                                try:
+                                    tt_delete_class(c)
+                                    st.success(f"Deleted {c}.")
+                                    st.rerun()
+                                except Exception as e:
+                                    st.error(f"Error: {e}")
+                else:
+                    st.info("No classes yet. Add one below.")
+
+                st.divider()
+                st.markdown("#### ➕ Add a Class")
+                st.caption("Use the format 'FORM X STREAM' — e.g. FORM 1 EAST, FORM 3 NORTH")
+
+                new_class_name = st.text_input("Class name", placeholder="e.g. FORM 1 NORTH", key="tt_new_class_name")
+
+                if st.button("➕ Add Class", type="primary", use_container_width=True, key="tt_add_class_btn"):
+                    if not new_class_name.strip():
+                        st.error("Enter a class name.")
+                    else:
+                        try:
+                            tt_create_class(new_class_name)
+                            st.success(f"Class '{new_class_name.strip().upper()}' added with all subjects. Go to 📚 Assignments to set teachers.")
+                            st.rerun()
+                        except Exception as e:
+                            st.error(f"Error: {e}")
+
+                st.info("ℹ️ Deleting a class removes all its subject-teacher assignments and any generated timetable slots for that class.")
 
     # TAB 9: Admin Accounts
     # ============================================================
