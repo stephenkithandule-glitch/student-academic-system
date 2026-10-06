@@ -96,11 +96,10 @@ def timetable_generator_tab():
     st.markdown("### 📅 Timetable Generator")
     st.caption("Generates multiple alternative timetables from the school's data.")
 
-      # Access the already-loaded app module (avoids circular import)
-           import sys
+    import sys
     _app = sys.modules.get("app") or sys.modules.get("__main__")
     if _app is None or not hasattr(_app, "tt_get_teachers"):
-        st.error("Could not load app functions. Please reload.")
+        st.error("Could not load app functions. Please reload the page.")
         st.stop()
 
     tt_get_teachers = _app.tt_get_teachers
@@ -211,16 +210,10 @@ def timetable_generator_tab():
         if successes > 0:
             st.success(f"Generated {successes} of {n_alts} alternatives successfully.")
             st.info(
-                "📥 To view the timetable, go to **📅 Timetable** → **View Timetable**. "
-                "The most recent successful run is what's stored."
-            )
-            st.caption(
-                "Note: Storing multiple alternatives side-by-side is coming soon. "
-                "For now, run them one at a time and download each PDF."
+                "📥 To view the timetable, go to **📅 Timetable** → **View Timetable**."
             )
         else:
             st.error("No timetables were generated. Check the setup and try again.")
-
 
 # ============================================================
 # MAIN RENDER
