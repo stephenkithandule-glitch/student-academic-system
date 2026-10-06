@@ -3225,7 +3225,7 @@ elif st.session_state.user_role == "parent":
 elif st.session_state.user_role == "teacher":
     nav_items = ["Dashboard", "Students", "Academic Results", "Streams", "Master Merit List", "Reports", "Learning Centre", "Online Tests & Quizzes", "Settings", "❓ Help & Guides"]
 else:
-    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "🤖 Timetable Advisor", "📊 Teacher Load Report", "💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Settings", "❓ Help & Guides"]
+    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "🤖 Timetable Advisor", "🤖 AI Advisor", "📊 Teacher Load Report", "💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Settings", "❓ Help & Guides"]
 
 page = st.sidebar.radio("Navigation", nav_items)
 st.sidebar.caption(f"Signed in as: **{st.session_state.user_role.title()}**")
