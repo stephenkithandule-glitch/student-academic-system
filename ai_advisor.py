@@ -97,7 +97,7 @@ def timetable_generator_tab():
     st.caption("Generates multiple alternative timetables from the school's data.")
 
       # Access the already-loaded app module (avoids circular import)
-       import sys
+           import sys
     _app = sys.modules.get("app") or sys.modules.get("__main__")
     if _app is None or not hasattr(_app, "tt_get_teachers"):
         st.error("Could not load app functions. Please reload.")
