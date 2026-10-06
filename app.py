@@ -3017,7 +3017,7 @@ def login_screen():
         unsafe_allow_html=True
     )
 
-            left, center, right = st.columns([1, 1.4, 1])
+    left, center, right = st.columns([1, 1.4, 1])
     with center:
         school_code = st.text_input(
             "School code",
