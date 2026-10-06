@@ -179,11 +179,11 @@ ensure_demo_users()
 
 def authenticate_user(username, password):
     try:
+        st.write("DEBUG: querying supabase at:", getattr(supabase, "supabase_url", "unknown"))
+        st.write("DEBUG: looking for username:", repr(username.strip()))
         result = supabase.table("users").select("*").eq("username", username.strip()).execute()
+        st.write("DEBUG: found rows:", len(result.data) if result.data else 0)
         if not result.data:
-            return None
-        user = result.data[0]
-        if not verify_password(password, user.get("password", "")):
             return None
         if "$" not in (user.get("password") or ""):
             supabase.table("users").update({
