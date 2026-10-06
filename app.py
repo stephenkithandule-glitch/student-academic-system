@@ -177,17 +177,16 @@ def ensure_demo_users():
 ensure_demo_users()
 
 
-def authenticate_user(username, password, client=None):
+def authenticate_user(username, password):
     try:
-        c = client or supabase
-        result = c.table("users").select("*").eq("username", username.strip()).execute()
+        result = supabase.table("users").select("*").eq("username", username.strip()).execute()
         if not result.data:
             return None
         user = result.data[0]
         if not verify_password(password, user.get("password", "")):
             return None
         if "$" not in (user.get("password") or ""):
-            c.table("users").update({
+            supabase.table("users").update({
                 "password": hash_password(password)
             }).eq("username", user["username"]).execute()
         return user
@@ -3067,15 +3066,8 @@ def login_screen():
                     pass  # if we can't parse, fail open
             # --- end Stage 3 ---
             st.success(f"Found: {_rows[0].get('school_name', school_code)}")
-                        # Build the school's own Supabase client
-            try:
-                from supabase import create_client as _create
-                _school_client = _create(_rows[0]["supabase_url"], _rows[0]["supabase_key"])
-            except Exception as _e:
-                st.error(f"Could not connect to your school's database: {_e}")
-                st.stop()
             # --- end Stage 2 ---
-            user = authenticate_user(username, password, client=_school_client)
+            user = authenticate_user(username, password)
             if user:
                 valid_role = (
                     (role == "Administrator" and user["role"] == "admin")
@@ -6636,7 +6628,6 @@ elif page == "🤖 AI Advisor":
         st.error("🔒 You don't have access to the AI Advisor.")
         st.stop()
     render_ai_advisor()
-
 
 
 
