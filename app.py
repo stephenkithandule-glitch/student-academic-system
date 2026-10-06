@@ -6621,7 +6621,7 @@ Free Study | 3"""
                 st.caption("ℹ️ This is a simulation only. Nothing was saved to the database.")
 
     st.stop()
-        st.stop()
+        
 
 
 elif page == "🤖 AI Advisor":
