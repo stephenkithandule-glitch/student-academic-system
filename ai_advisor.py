@@ -96,14 +96,18 @@ def timetable_generator_tab():
     st.markdown("### 📅 Timetable Generator")
     st.caption("Generates multiple alternative timetables from the school's data.")
 
-    # Import here to avoid circular imports
-    from app import (
-        tt_get_teachers,
-        tt_get_subjects,
-        tt_get_all_classes,
-        tt_get_periods,
-        tt_generate_timetable,
-    )
+      # Access the already-loaded app module (avoids circular import)
+    import sys
+    _app = sys.modules.get("app")
+    if _app is None:
+        st.error("App module not loaded. Please reload the page.")
+        st.stop()
+
+    tt_get_teachers = _app.tt_get_teachers
+    tt_get_subjects = _app.tt_get_subjects
+    tt_get_all_classes = _app.tt_get_all_classes
+    tt_get_periods = _app.tt_get_periods
+    tt_generate_timetable = _app.tt_generate_timetable
 
     try:
         teachers = tt_get_teachers()
