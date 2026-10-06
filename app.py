@@ -31,6 +31,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+st.error("🧪 STAGING ENVIRONMENT — NOT FOR REAL USE")
 
 st.markdown("""
 <style>
@@ -3018,11 +3019,54 @@ def login_screen():
 
     left, center, right = st.columns([1, 1.4, 1])
     with center:
+        school_code = st.text_input(
+            "School code",
+            placeholder="e.g. exc",
+            help="Ask your school administrator if you don't know this."
+        ).strip().lower()
+
         role = st.selectbox("Login as", ["Administrator", "Teacher", "Student", "Parent", "Clerk", "Exams Officer", "IT Officer"])
         username = st.text_input("Username")
         password = st.text_input("Password", type="password")
 
         if st.button("Sign in", type="primary", use_container_width=True):
+                        # --- Stage 2: control plane lookup ---
+            if not school_code:
+                st.error("Please enter your school code.")
+                st.stop()
+            try:
+                _ctl_url = st.secrets["CONTROL_URL"]
+                _ctl_key = st.secrets["CONTROL_KEY"]
+                import requests as _rq
+                _r = _rq.get(
+                    f"{_ctl_url}/rest/v1/schools?school_id=eq.{school_code}&select=*",
+                    headers={"apikey": _ctl_key, "Authorization": f"Bearer {_ctl_key}"},
+                    timeout=10,
+                )
+                _rows = _r.json() if _r.status_code == 200 else []
+            except Exception as _e:
+                st.error(f"Could not reach the control plane: {_e}")
+                st.stop()
+
+            if not _rows:
+                st.error(f"Invalid school code: '{school_code}'")
+                st.stop()
+
+            st.session_state.school = _rows[0]
+                        # --- Stage 3: subscription check ---
+            from datetime import datetime as _dt
+            _exp = _rows[0].get("expires_at")
+            if _exp:
+                try:
+                    _exp_dt = _dt.fromisoformat(str(_exp).replace("Z", "+00:00"))
+                    if _exp_dt < _dt.now(_exp_dt.tzinfo):
+                        st.error("🔒 Your school's subscription has expired. Please contact the school office.")
+                        st.stop()
+                except Exception:
+                    pass  # if we can't parse, fail open
+            # --- end Stage 3 ---
+            st.success(f"Found: {_rows[0].get('school_name', school_code)}")
+            # --- end Stage 2 ---
             user = authenticate_user(username, password)
             if user:
                 valid_role = (
