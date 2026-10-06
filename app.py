@@ -177,16 +177,17 @@ def ensure_demo_users():
 ensure_demo_users()
 
 
-def authenticate_user(username, password):
+def authenticate_user(username, password, client=None):
     try:
-        st.write("DEBUG: querying supabase at:", getattr(supabase, "supabase_url", "unknown"))
-        st.write("DEBUG: looking for username:", repr(username.strip()))
-        result = supabase.table("users").select("*").eq("username", username.strip()).execute()
-        st.write("DEBUG: found rows:", len(result.data) if result.data else 0)
+        c = client or supabase
+        result = c.table("users").select("*").eq("username", username.strip()).execute()
         if not result.data:
             return None
+        user = result.data[0]
+        if not verify_password(password, user.get("password", "")):
+            return None
         if "$" not in (user.get("password") or ""):
-            supabase.table("users").update({
+            c.table("users").update({
                 "password": hash_password(password)
             }).eq("username", user["username"]).execute()
         return user
@@ -3066,8 +3067,15 @@ def login_screen():
                     pass  # if we can't parse, fail open
             # --- end Stage 3 ---
             st.success(f"Found: {_rows[0].get('school_name', school_code)}")
+                        # Build the school's own Supabase client
+            try:
+                from supabase import create_client as _create
+                _school_client = _create(_rows[0]["supabase_url"], _rows[0]["supabase_key"])
+            except Exception as _e:
+                st.error(f"Could not connect to your school's database: {_e}")
+                st.stop()
             # --- end Stage 2 ---
-            user = authenticate_user(username, password)
+            user = authenticate_user(username, password, client=_school_client)
             if user:
                 valid_role = (
                     (role == "Administrator" and user["role"] == "admin")
