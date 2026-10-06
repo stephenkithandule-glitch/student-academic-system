@@ -3030,6 +3030,31 @@ def login_screen():
         password = st.text_input("Password", type="password")
 
         if st.button("Sign in", type="primary", use_container_width=True):
+                        # --- Stage 2: control plane lookup ---
+            if not school_code:
+                st.error("Please enter your school code.")
+                st.stop()
+            try:
+                _ctl_url = st.secrets["CONTROL_URL"]
+                _ctl_key = st.secrets["CONTROL_KEY"]
+                import requests as _rq
+                _r = _rq.get(
+                    f"{_ctl_url}/rest/v1/schools?school_id=eq.{school_code}&select=*",
+                    headers={"apikey": _ctl_key, "Authorization": f"Bearer {_ctl_key}"},
+                    timeout=10,
+                )
+                _rows = _r.json() if _r.status_code == 200 else []
+            except Exception as _e:
+                st.error(f"Could not reach the control plane: {_e}")
+                st.stop()
+
+            if not _rows:
+                st.error(f"Invalid school code: '{school_code}'")
+                st.stop()
+
+            st.session_state.school = _rows[0]
+            st.success(f"Found: {_rows[0].get('school_name', school_code)}")
+            # --- end Stage 2 ---
             user = authenticate_user(username, password)
             if user:
                 valid_role = (
