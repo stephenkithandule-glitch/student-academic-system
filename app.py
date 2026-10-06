@@ -15,6 +15,7 @@ import matplotlib.pyplot as plt
 from scipy.stats import linregress
 import streamlit as st
 from supabase import create_client, Client
+from ai_advisor import render_ai_advisor
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import letter, landscape
@@ -3212,11 +3213,11 @@ st.markdown(
 # ============================================================
 
 if st.session_state.user_role == "it_officer":
-    nav_items = ["Dashboard", "📅 Timetable", "🤖 Timetable Advisor", "📊 Teacher Load Report", "Change Password", "Settings", "❓ Help & Guides"]
+    nav_items = ["Dashboard", "📅 Timetable", "🤖 Timetable Advisor", "🤖 AI Advisor", "📊 Teacher Load Report", "Change Password", "Settings", "❓ Help & Guides"]
 elif st.session_state.user_role == "clerk":
     nav_items = ["💰 Fee Structure", "💵 Record Payment", "📒 Student Ledger", "📊 Fee Reports", "Change Password", "❓ Help & Guides"]
 elif st.session_state.user_role == "exams":
-    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "🤖 Timetable Advisor", "📊 Teacher Load Report", "Settings", "❓ Help & Guides"]
+    nav_items = ["Dashboard", "Students", "Student Records", "Academic Results", "Streams", "Master Merit List", "Analytics", "Reports", "Learning Centre", "Online Tests & Quizzes", "📅 Timetable", "🤖 Timetable Advisor", "🤖 AI Advisor", "📊 Teacher Load Report", "Settings", "❓ Help & Guides"]
 elif st.session_state.user_role == "student":
     nav_items = ["My Dashboard", "Learning Centre", "Online Tests & Quizzes", "My Profile", "Change Password", "❓ Help & Guides"]
 elif st.session_state.user_role == "parent":
@@ -6620,6 +6621,18 @@ Free Study | 3"""
                 st.caption("ℹ️ This is a simulation only. Nothing was saved to the database.")
 
     st.stop()
+        st.stop()
+
+
+elif page == "🤖 AI Advisor":
+    if st.session_state.user_role not in ["admin", "exams", "it_officer"]:
+        st.error("🔒 You don't have access to the AI Advisor.")
+        st.stop()
+    render_ai_advisor()
+
+
+elif page == "Settings":
+    ...
 
 
 elif page == "Settings":
