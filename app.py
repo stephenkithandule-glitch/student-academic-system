@@ -3053,6 +3053,18 @@ def login_screen():
                 st.stop()
 
             st.session_state.school = _rows[0]
+                        # --- Stage 3: subscription check ---
+            from datetime import datetime as _dt
+            _exp = _rows[0].get("expires_at")
+            if _exp:
+                try:
+                    _exp_dt = _dt.fromisoformat(str(_exp).replace("Z", "+00:00"))
+                    if _exp_dt < _dt.now(_exp_dt.tzinfo):
+                        st.error("🔒 Your school's subscription has expired. Please contact the school office.")
+                        st.stop()
+                except Exception:
+                    pass  # if we can't parse, fail open
+            # --- end Stage 3 ---
             st.success(f"Found: {_rows[0].get('school_name', school_code)}")
             # --- end Stage 2 ---
             user = authenticate_user(username, password)
