@@ -6630,8 +6630,6 @@ elif page == "🤖 AI Advisor":
     render_ai_advisor()
 
 
-elif page == "Settings":
-    ...
 
 
 elif page == "Settings":
