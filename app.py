@@ -3223,23 +3223,32 @@ if st.sidebar.button("Sign out", use_container_width=True):
 # ============================================================
 
 if st.session_state.data is None and st.session_state.user_role not in ["student", "parent"]:
-    st.markdown(
-        '<div class="app-title">Welcome to the Academic Management System</div>',
-        unsafe_allow_html=True
-    )
-    st.markdown(
-        '<div class="app-subtitle">Upload your student_results.xlsx file from the left menu to begin.</div>',
-        unsafe_allow_html=True
-    )
-
-    st.markdown("### First-time setup")
-    st.write("1. Upload the Excel file using the button on the left.")
-    st.write("2. Choose the analysis term.")
-    st.write("3. Click **Load / Analyse Results**.")
-    st.write("4. For the Excel format guide, go to **Settings → 📄 Excel Format Guide**.")
-
-
-    st.stop()
+    SETUP_PAGES_WITHOUT_DATA = {
+        "Settings",
+        "❓ Help & Guides",
+        "Change Password",
+        "📅 Timetable",
+        "🤖 Timetable Advisor",
+        "🤖 AI Advisor",
+        "📊 Teacher Load Report",
+    }
+    if page not in SETUP_PAGES_WITHOUT_DATA:
+        st.markdown(
+            '<div class="app-title">Welcome to the Academic Management System</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            '<div class="app-subtitle">Upload your student_results.xlsx file from the left menu to begin, '
+            'or go to <b>Settings</b> to configure your school first.</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown("### First-time setup")
+        st.write("1. **Set up your school** — go to **Settings → 🏫 School Profile**.")
+        st.write("2. **Add staff accounts** — go to **Settings → 👨‍🏫 Teacher Accounts**.")
+        st.write("3. **Upload students** — use the sidebar file uploader.")
+        st.write("4. **Choose analysis term** and click **Load / Analyse Results**.")
+        st.write("5. For the Excel format guide, go to **Settings → 📄 Excel Format Guide**.")
+        st.stop()
 
 
 # ============================================================
