@@ -177,23 +177,23 @@ def ensure_demo_users():
 ensure_demo_users()
 
 
-def authenticate_user(username, password, client=None):
+def authenticate_user(username, password):
     try:
-        c = client or supabase
-        result = c.table("users").select("*").eq("username", username.strip()).execute()
+        result = supabase.table("users").select("*").eq("username", username.strip()).execute()
         if not result.data:
             return None
         user = result.data[0]
         if not verify_password(password, user.get("password", "")):
             return None
         if "$" not in (user.get("password") or ""):
-            c.table("users").update({
+            supabase.table("users").update({
                 "password": hash_password(password)
             }).eq("username", user["username"]).execute()
         return user
     except Exception as e:
         st.error(f"Database error during login: {e}")
         return None
+
 
 def get_parent_profile(username):
     try:
@@ -3066,13 +3066,6 @@ def login_screen():
                     pass  # if we can't parse, fail open
             # --- end Stage 3 ---
             st.success(f"Found: {_rows[0].get('school_name', school_code)}")
-                        # Build the school's own Supabase client
-            try:
-                from supabase import create_client as _create
-                _school_client = _create(_rows[0]["supabase_url"], _rows[0]["supabase_key"])
-            except Exception as _e:
-                st.error(f"Could not connect to your school's database: {_e}")
-                st.stop()
             # --- end Stage 2 ---
             user = authenticate_user(username, password)
             if user:
@@ -3160,6 +3153,28 @@ if st.session_state.data is None:
             pass
 
 
+# ============================================================
+# WELCOME SCREEN FOR ADMIN/TEACHER WITH NO DATA
+# ============================================================
+
+if st.session_state.data is None and st.session_state.user_role not in ["student", "parent"]:
+    st.markdown(
+        '<div class="app-title">Welcome to the Academic Management System</div>',
+        unsafe_allow_html=True
+    )
+    st.markdown(
+        '<div class="app-subtitle">Upload your student_results.xlsx file from the left menu to begin.</div>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown("### First-time setup")
+    st.write("1. Upload the Excel file using the button on the left.")
+    st.write("2. Choose the analysis term.")
+    st.write("3. Click **Load / Analyse Results**.")
+    st.write("4. For the Excel format guide, go to **Settings → 📄 Excel Format Guide**.")
+
+  
+    st.stop()
 
 
 # ============================================================
@@ -3224,27 +3239,6 @@ if st.sidebar.button("Sign out", use_container_width=True):
     st.session_state.student_name = ""
     st.session_state.raw_data = None
     st.rerun()
-    
-# ============================================================
-# WELCOME SCREEN FOR ADMIN/TEACHER WITH NO DATA
-# ============================================================
-
-if st.session_state.data is None and st.session_state.user_role not in ["student", "parent"]:
-    st.markdown(
-        '<div class="app-title">Welcome to the Academic Management System</div>',
-        unsafe_allow_html=True
-    )
-    st.markdown(
-        '<div class="app-subtitle">Upload your student_results.xlsx file from the left menu to begin.</div>',
-        unsafe_allow_html=True
-    )
-
-    st.markdown("### First-time setup")
-    st.write("1. Upload the Excel file using the button on the left.")
-    st.write("2. Choose the analysis term.")
-    st.write("3. Click **Load / Analyse Results**.")
-    st.write("4. For the Excel format guide, go to **Settings → 📄 Excel Format Guide**.")
-    st.stop()
 
 
 # ============================================================
@@ -6636,6 +6630,8 @@ elif page == "🤖 AI Advisor":
     render_ai_advisor()
 
 
+elif page == "Settings":
+    ...
 
 
 elif page == "Settings":
