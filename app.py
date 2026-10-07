@@ -3159,7 +3159,8 @@ if st.session_state.data is None:
 # DATA ASSIGNMENT
 # ============================================================
 
-if st.session_state.data is None and st.session_state.user_role in ["student", "parent"]:
+if st.session_state.data is None:
+    # No data loaded yet — admin, teacher, student, or parent
     data = None
     df = pd.DataFrame()
     target = name_col = stream_col = None
@@ -3169,7 +3170,6 @@ else:
     target = data["target_rank_col"]
     name_col = data["name_col"]
     stream_col = data["stream_col"]
-
 
 # ============================================================
 # HEADER
