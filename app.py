@@ -128,7 +128,7 @@ def get_supabase_client() -> Client:
             "Please add SUPABASE_URL and SUPABASE_KEY to Streamlit Secrets."
         )
         st.stop()
-     return create_client(url, key)
+    return create_client(url, key)
 
 
 class _SupabaseProxy:
