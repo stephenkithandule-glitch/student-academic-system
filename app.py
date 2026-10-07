@@ -131,7 +131,35 @@ def get_supabase_client() -> Client:
     return create_client(url, key)
 
 
-supabase = get_supabase_client()
+class _SupabaseProxy:
+    """Routes every query to the logged-in school's client.
+    Falls back to the default (global) client if no school is logged in."""
+
+    def _client(self):
+        c = st.session_state.get("school_client")
+        if c is not None:
+            return c
+        if "_default_client" not in st.session_state:
+            st.session_state["_default_client"] = get_supabase_client()
+        return st.session_state["_default_client"]
+
+    def table(self, *args, **kwargs):
+        return self._client().table(*args, **kwargs)
+
+    def auth(self, *args, **kwargs):
+        return self._client().auth
+
+    def storage(self, *args, **kwargs):
+        return self._client().storage
+
+    def rpc(self, *args, **kwargs):
+        return self._client().rpc(*args, **kwargs)
+
+    def postgrest(self):
+        return self._client().postgrest
+
+
+supabase = _SupabaseProxy()
 
 
 # ============================================================
@@ -177,9 +205,10 @@ def ensure_demo_users():
 ensure_demo_users()
 
 
-def authenticate_user(username, password):
+def authenticate_user(username, password, client=None):
     try:
-        result = supabase.table("users").select("*").eq("username", username.strip()).execute()
+        c = client or supabase
+        result = c.table("users").select("*").eq("username", username.strip()).execute()
         if not result.data:
             return None
         user = result.data[0]
@@ -3066,9 +3095,22 @@ def login_screen():
                     pass  # if we can't parse, fail open
             # --- end Stage 3 ---
             st.success(f"Found: {_rows[0].get('school_name', school_code)}")
-            # --- end Stage 2 ---
-            user = authenticate_user(username, password)
+
+            # --- Stage 2.5: Build the school's own Supabase client ---
+            try:
+                from supabase import create_client as _create
+                _school_client = _create(
+                    _rows[0]["supabase_url"],
+                    _rows[0]["supabase_key"]
+                )
+            except Exception as _e:
+                st.error(f"Could not connect to your school's database: {_e}")
+                st.stop()
+            # --- end Stage 2.5 ---
+
+            user = authenticate_user(username, password, client=_school_client)
             if user:
+                st.session_state.school_client = _school_client
                 valid_role = (
                     (role == "Administrator" and user["role"] == "admin")
                     or (role == "Teacher" and user["role"] == "teacher")
@@ -3153,35 +3195,14 @@ if st.session_state.data is None:
             pass
 
 
-# ============================================================
-# WELCOME SCREEN FOR ADMIN/TEACHER WITH NO DATA
-# ============================================================
-
-if st.session_state.data is None and st.session_state.user_role not in ["student", "parent"]:
-    st.markdown(
-        '<div class="app-title">Welcome to the Academic Management System</div>',
-        unsafe_allow_html=True
-    )
-    st.markdown(
-        '<div class="app-subtitle">Upload your student_results.xlsx file from the left menu to begin.</div>',
-        unsafe_allow_html=True
-    )
-
-    st.markdown("### First-time setup")
-    st.write("1. Upload the Excel file using the button on the left.")
-    st.write("2. Choose the analysis term.")
-    st.write("3. Click **Load / Analyse Results**.")
-    st.write("4. For the Excel format guide, go to **Settings → 📄 Excel Format Guide**.")
-
-  
-    st.stop()
 
 
 # ============================================================
 # DATA ASSIGNMENT
 # ============================================================
 
-if st.session_state.data is None and st.session_state.user_role in ["student", "parent"]:
+if st.session_state.data is None:
+    # No data loaded yet — admin, teacher, student, or parent
     data = None
     df = pd.DataFrame()
     target = name_col = stream_col = None
@@ -3191,7 +3212,6 @@ else:
     target = data["target_rank_col"]
     name_col = data["name_col"]
     stream_col = data["stream_col"]
-
 
 # ============================================================
 # HEADER
@@ -3238,7 +3258,40 @@ if st.sidebar.button("Sign out", use_container_width=True):
     st.session_state.username = ""
     st.session_state.student_name = ""
     st.session_state.raw_data = None
+    st.session_state.pop("school_client", None)
     st.rerun()
+    
+# ============================================================
+# WELCOME SCREEN FOR ADMIN/TEACHER WITH NO DATA
+# ============================================================
+
+if st.session_state.data is None and st.session_state.user_role not in ["student", "parent"]:
+    SETUP_PAGES_WITHOUT_DATA = {
+        "Settings",
+        "❓ Help & Guides",
+        "Change Password",
+        "📅 Timetable",
+        "🤖 Timetable Advisor",
+        "🤖 AI Advisor",
+        "📊 Teacher Load Report",
+    }
+    if page not in SETUP_PAGES_WITHOUT_DATA:
+        st.markdown(
+            '<div class="app-title">Welcome to the Academic Management System</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown(
+            '<div class="app-subtitle">Upload your student_results.xlsx file from the left menu to begin, '
+            'or go to <b>Settings</b> to configure your school first.</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown("### First-time setup")
+        st.write("1. **Set up your school** — go to **Settings → 🏫 School Profile**.")
+        st.write("2. **Add staff accounts** — go to **Settings → 👨‍🏫 Teacher Accounts**.")
+        st.write("3. **Upload students** — use the sidebar file uploader.")
+        st.write("4. **Choose analysis term** and click **Load / Analyse Results**.")
+        st.write("5. For the Excel format guide, go to **Settings → 📄 Excel Format Guide**.")
+        st.stop()
 
 
 # ============================================================
@@ -6630,8 +6683,6 @@ elif page == "🤖 AI Advisor":
     render_ai_advisor()
 
 
-elif page == "Settings":
-    ...
 
 
 elif page == "Settings":
