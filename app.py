@@ -3164,7 +3164,6 @@ if st.session_state.data is None:
 # WELCOME SCREEN FOR ADMIN/TEACHER WITH NO DATA
 # ============================================================
 
-# Pages that don't need student data and should stay accessible before upload
 SETUP_PAGES_WITHOUT_DATA = {
     "Settings",
     "❓ Help & Guides",
@@ -3181,11 +3180,9 @@ if st.session_state.data is None and st.session_state.user_role not in ["student
             '<div class="app-title">Welcome to the Academic Management System</div>',
             unsafe_allow_html=True
         )
-        st.markdown(
-            '<div class="app-subtitle">Upload your student_results.xlsx file from the left menu to begin, '
-            'or go to <b>Settings</b> to configure your school first.</div>',
-            unsafe_allow_html=True
-        )
+        ...
+        st.stop()
+        
 
         st.markdown("### First-time setup")
         st.write("1. **Set up your school** — go to **Settings → 🏫 School Profile**.")
