@@ -128,10 +128,38 @@ def get_supabase_client() -> Client:
             "Please add SUPABASE_URL and SUPABASE_KEY to Streamlit Secrets."
         )
         st.stop()
-    return create_client(url, key)
+     return create_client(url, key)
 
 
-supabase = get_supabase_client()
+class _SupabaseProxy:
+    """Routes every query to the logged-in school's client.
+    Falls back to the default (global) client if no school is logged in."""
+
+    def _client(self):
+        c = st.session_state.get("school_client")
+        if c is not None:
+            return c
+        if "_default_client" not in st.session_state:
+            st.session_state["_default_client"] = get_supabase_client()
+        return st.session_state["_default_client"]
+
+    def table(self, *args, **kwargs):
+        return self._client().table(*args, **kwargs)
+
+    def auth(self, *args, **kwargs):
+        return self._client().auth
+
+    def storage(self, *args, **kwargs):
+        return self._client().storage
+
+    def rpc(self, *args, **kwargs):
+        return self._client().rpc(*args, **kwargs)
+
+    def postgrest(self):
+        return self._client().postgrest
+
+
+supabase = _SupabaseProxy()
 
 
 # ============================================================
@@ -3082,6 +3110,7 @@ def login_screen():
 
             user = authenticate_user(username, password, client=_school_client)
             if user:
+                st.session_state.school_client = _school_client
                 valid_role = (
                     (role == "Administrator" and user["role"] == "admin")
                     or (role == "Teacher" and user["role"] == "teacher")
@@ -3229,6 +3258,7 @@ if st.sidebar.button("Sign out", use_container_width=True):
     st.session_state.username = ""
     st.session_state.student_name = ""
     st.session_state.raw_data = None
+    st.session_state.pop("school_client", None)
     st.rerun()
     
 # ============================================================
