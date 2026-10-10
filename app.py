@@ -8218,11 +8218,13 @@ For **every term**, the app expects 3 types of columns:
                 "👨‍👩‍👧 Parents",
             ])
 
-            # ---------- TEACHERS ----------
+                        # ---------- TEACHERS ----------
             with import_tab_teachers:
                 st.markdown("### Upload Teachers")
                 st.caption(
-                    "Excel columns: **Full Name** (required) · **Username** (optional) · **Password** (optional)"
+                    "Excel columns: **Full Name** (required) · **Subjects** (optional, comma-sep) · "
+                    "**Classes** (optional, pipe-sep). Creates a login account, a timetable teacher row, "
+                    "and class assignments — all in one import."
                 )
                 teacher_file = st.file_uploader(
                     "Teachers Excel",
@@ -8233,27 +8235,27 @@ For **every term**, the app expects 3 types of columns:
                     try:
                         df_t = pd.read_excel(teacher_file)
                         df_t.columns = [str(c).strip().lower() for c in df_t.columns]
-                        # Find name column
                         name_col_t = None
                         for c in df_t.columns:
                             if c in ["full name", "name", "teacher name", "full_name"]:
                                 name_col_t = c
                                 break
                         if name_col_t is None:
-                            st.error(
-                                "Could not find a name column. Use 'Full Name' or 'Name' as a column header."
-                            )
+                            st.error("Could not find a name column. Use 'Full Name' or 'Name'.")
                         else:
+                            if name_col_t != "full name":
+                                df_t = df_t.rename(columns={name_col_t: "full name"})
+
                             st.write(f"**Detected {len(df_t)} rows.** Preview:")
                             st.dataframe(df_t.head(5), use_container_width=True, hide_index=True)
 
                             if st.button("🚀 Import Teachers", type="primary", key="bulk_import_teachers_btn"):
-                                with st.spinner("Creating teacher accounts..."):
-                                    result = _bulk_import_users(df_t, "teacher", name_col_t)
+                                with st.spinner("Creating teacher accounts + timetable rows + assignments..."):
+                                    result = _bulk_import_teachers_full(df_t)
 
                                 st.success(f"✅ Created {len(result['created'])} teacher accounts.")
                                 if result["skipped"]:
-                                    st.warning(f"⚠️ Skipped {len(result['skipped'])} rows (already exist).")
+                                    st.warning(f"⚠️ Skipped {len(result['skipped'])} rows.")
                                 if result["errors"]:
                                     st.error(f"❌ {len(result['errors'])} rows had errors.")
 
@@ -8266,12 +8268,6 @@ For **every term**, the app expects 3 types of columns:
                                         mime="text/csv",
                                         key="bulk_teacher_csv_dl",
                                     )
-                                    with st.expander("Show created accounts"):
-                                        st.dataframe(
-                                            pd.DataFrame(result["created"]),
-                                            use_container_width=True,
-                                            hide_index=True,
-                                        )
                     except Exception as e:
                         st.error(f"Error reading file: {e}")
 
