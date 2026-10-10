@@ -8176,7 +8176,7 @@ For **every term**, the app expects 3 types of columns:
         else:
             st.write("### Download a full backup")
             st.caption("ZIP with all cloud tables as JSON files.")
-                        st.divider()
+            st.divider()
             st.markdown("### 📦 Download Full Backup (3 files)")
 
             st.info(
