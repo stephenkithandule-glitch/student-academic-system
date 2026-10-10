@@ -8341,7 +8341,7 @@ For **every term**, the app expects 3 types of columns:
                     except Exception as e:
                         st.error(f"Error reading file: {e}")
 
-            # ---------- STUDENTS ----------
+                        # ---------- STUDENTS ----------
             with import_tab_students:
                 st.markdown("### Upload Students")
                 st.caption(
@@ -8365,12 +8365,15 @@ For **every term**, the app expects 3 types of columns:
                         if name_col_s is None:
                             st.error("Could not find a name column. Use 'Full Name' or 'Name'.")
                         else:
+                            if name_col_s != "full name":
+                                df_s = df_s.rename(columns={name_col_s: "full name"})
+
                             st.write(f"**Detected {len(df_s)} rows.** Preview:")
                             st.dataframe(df_s.head(5), use_container_width=True, hide_index=True)
 
                             if st.button("🚀 Import Students", type="primary", key="bulk_import_students_btn"):
                                 with st.spinner("Creating student accounts..."):
-                                    result = _bulk_import_users(df_s, "student", name_col_s)
+                                    result = _bulk_import_users(df_s, "student", "full name")
 
                                 st.success(f"✅ Created {len(result['created'])} student accounts.")
                                 if result["skipped"]:
@@ -8387,12 +8390,6 @@ For **every term**, the app expects 3 types of columns:
                                         mime="text/csv",
                                         key="bulk_student_csv_dl",
                                     )
-                                    with st.expander("Show created accounts"):
-                                        st.dataframe(
-                                            pd.DataFrame(result["created"]),
-                                            use_container_width=True,
-                                            hide_index=True,
-                                        )
                     except Exception as e:
                         st.error(f"Error reading file: {e}")
 
@@ -8420,12 +8417,15 @@ For **every term**, the app expects 3 types of columns:
                         if name_col_p is None:
                             st.error("Could not find a name column. Use 'Full Name' or 'Name'.")
                         else:
+                            if name_col_p != "full name":
+                                df_p = df_p.rename(columns={name_col_p: "full name"})
+
                             st.write(f"**Detected {len(df_p)} rows.** Preview:")
                             st.dataframe(df_p.head(5), use_container_width=True, hide_index=True)
 
                             if st.button("🚀 Import Parents", type="primary", key="bulk_import_parents_btn"):
                                 with st.spinner("Creating parent accounts..."):
-                                    result = _bulk_import_users(df_p, "parent", name_col_p)
+                                    result = _bulk_import_users(df_p, "parent", "full name")
 
                                 st.success(f"✅ Created {len(result['created'])} parent accounts.")
                                 if result["skipped"]:
@@ -8442,39 +8442,6 @@ For **every term**, the app expects 3 types of columns:
                                         mime="text/csv",
                                         key="bulk_parent_csv_dl",
                                     )
-                                    with st.expander("Show created accounts"):
-                                        st.dataframe(
-                                            pd.DataFrame(result["created"]),
-                                            use_container_width=True,
-                                            hide_index=True,
-                                        )
                     except Exception as e:
                         st.error(f"Error reading file: {e}")
-
-            if db_ok:
-                st.success("✅ All systems operational.")
-            else:
-                st.error("⚠️ Database is unreachable. Contact the developer immediately.")
-
-            st.write("### Download a full backup")
-            st.caption("ZIP with all cloud tables as JSON files.")
-            if st.button("Prepare Backup ZIP", type="primary", use_container_width=True, key="backup_prepare_btn"):
-                with st.spinner("Packaging backup..."):
-                    backup = create_backup_zip()
-                st.download_button(
-                    "⬇️ Download Backup ZIP",
-                    data=backup.getvalue(),
-                    file_name=f"Academic_System_Backup_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
-                    mime="application/zip",
-                    use_container_width=True
-                )
-
-            st.divider()
-            st.write("### Current data")
-            st.write(f"**File:** {st.session_state.raw_file_name or 'No file loaded'}")
-            if data is not None:
-                st.write(f"**Analysis term:** {data['analysis_term'].upper()}")
-                st.write(f"**Students:** {len(df)}")
-                st.write(f"**Streams:** {df[stream_col].nunique()}")
-
             st.success("✅ All data is stored in Supabase — it persists across app restarts.")
