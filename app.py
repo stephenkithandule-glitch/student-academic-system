@@ -3281,6 +3281,238 @@ def generate_all_student_pdfs(data, school_name):
 
 
 # ============================================================
+def _backup_excel_bytes():
+    """Build an Excel workbook with one sheet per role. No passwords."""
+    import openpyxl
+    from io import BytesIO
+
+    buf = BytesIO()
+
+    # Fetch all users
+    try:
+        rows = supabase.table("users").select("username,role,student_name").execute().data or []
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch users: {e}")
+
+    # Fetch parents (child links)
+    parents_map = {}
+    try:
+        prows = supabase.table("parents").select("username,parent_name,child_names").execute().data or []
+        for p in prows:
+            parents_map[p["username"]] = p.get("child_names") or ""
+    except Exception:
+        pass
+
+    # Group by role
+    groups = {
+        "Admins": [],
+        "Teachers": [],
+        "Students": [],
+        "Parents": [],
+        "Clerks": [],
+        "Exams Officers": [],
+        "IT Officers": [],
+    }
+    for r in rows:
+        role = (r.get("role") or "").lower()
+        if role == "admin":
+            groups["Admins"].append(r)
+        elif role == "teacher":
+            groups["Teachers"].append(r)
+        elif role == "student":
+            groups["Students"].append(r)
+        elif role == "parent":
+            groups["Parents"].append(r)
+        elif role == "clerk":
+            groups["Clerks"].append(r)
+        elif role == "exams":
+            groups["Exams Officers"].append(r)
+        elif role == "it_officer":
+            groups["IT Officers"].append(r)
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)  # drop default sheet
+
+    # ---- Summary sheet ----
+    ws = wb.create_sheet("Summary")
+    ws.append(["SCHOOL BACKUP SUMMARY"])
+    ws.append([])
+    ws.append(["School", st.session_state.get("school_name", "")])
+    ws.append(["Generated", datetime.now().strftime("%d %B %Y at %H:%M")])
+    ws.append([])
+    ws.append(["Role", "Count"])
+    total = 0
+    for label, items in groups.items():
+        ws.append([label, len(items)])
+        total += len(items)
+    ws.append([])
+    ws.append(["TOTAL", total])
+    ws.column_dimensions["A"].width = 25
+    ws.column_dimensions["B"].width = 40
+
+    # ---- One sheet per group ----
+    for label, items in groups.items():
+        if not items:
+            continue
+        ws = wb.create_sheet(label[:31])  # Excel sheet name limit
+
+        if label == "Parents":
+            ws.append(["Full Name", "Username", "Children"])
+            for r in sorted(items, key=lambda x: x.get("student_name") or ""):
+                ws.append([
+                    r.get("student_name") or "",
+                    r.get("username") or "",
+                    parents_map.get(r.get("username"), ""),
+                ])
+        else:
+            ws.append(["Full Name", "Username"])
+            for r in sorted(items, key=lambda x: x.get("student_name") or ""):
+                ws.append([
+                    r.get("student_name") or "",
+                    r.get("username") or "",
+                ])
+
+        # Column widths
+        ws.column_dimensions["A"].width = 35
+        ws.column_dimensions["B"].width = 30
+        if label == "Parents":
+            ws.column_dimensions["C"].width = 40
+
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _backup_passwords_csv_bytes():
+    """Build a CSV with username + password hash. Sensitive — do not share."""
+    try:
+        rows = supabase.table("users").select("username,password,role").execute().data or []
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch users: {e}")
+
+    lines = ["Username,Password Hash,Role"]
+    for r in sorted(rows, key=lambda x: x.get("username") or ""):
+        username = str(r.get("username") or "").replace(",", "")
+        pw = str(r.get("password") or "").replace(",", "")
+        role = str(r.get("role") or "")
+        lines.append(f"{username},{pw},{role}")
+    return "\n".join(lines).encode("utf-8")
+
+
+def _backup_summary_pdf_bytes():
+    """Build a one-page printable PDF summary of the school's accounts."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    import io as _io
+
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=30, rightMargin=30, topMargin=30, bottomMargin=30
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "TitleX", parent=styles["Heading1"],
+        fontName="Helvetica-Bold", fontSize=16, leading=20, alignment=1
+    )
+    subtitle_style = ParagraphStyle(
+        "SubX", parent=styles["Normal"],
+        fontSize=10, leading=12, alignment=1,
+        textColor=colors.HexColor("#555555")
+    )
+    section_style = ParagraphStyle(
+        "SectionX", parent=styles["Normal"],
+        fontName="Helvetica-Bold", fontSize=12, leading=14,
+        spaceBefore=10, spaceAfter=4
+    )
+    cell_style = ParagraphStyle(
+        "CellX", parent=styles["Normal"], fontSize=9, leading=11
+    )
+
+    try:
+        rows = supabase.table("users").select("username,role,student_name").execute().data or []
+    except Exception:
+        rows = []
+
+    groups = {"admin": [], "teacher": [], "student": [], "parent": [], "clerk": [], "exams": [], "it_officer": []}
+    for r in rows:
+        role = (r.get("role") or "").lower()
+        if role in groups:
+            groups[role].append(r)
+
+    story = []
+    story.append(Paragraph(st.session_state.get("school_name", "School"), title_style))
+    story.append(Paragraph("System Backup Summary", subtitle_style))
+    story.append(Paragraph(
+        f"Generated: {datetime.now().strftime('%d %B %Y at %H:%M')}",
+        subtitle_style
+    ))
+    story.append(Spacer(1, 20))
+
+    # ---- Summary table ----
+    summary_data = [["Role", "Count"]]
+    total = 0
+    labels = {
+        "admin": "Administrators",
+        "teacher": "Teachers",
+        "student": "Students",
+        "parent": "Parents",
+        "clerk": "Clerks",
+        "exams": "Exams Officers",
+        "it_officer": "IT Officers",
+    }
+    for key, label in labels.items():
+        count = len(groups[key])
+        summary_data.append([label, str(count)])
+        total += count
+    summary_data.append(["TOTAL", str(total)])
+
+    t = Table(summary_data, colWidths=[200, 100])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#263238")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#edf1f3")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c9d0d6")),
+        ("ALIGN", (1, 0), (1, -1), "CENTER"),
+        ("PADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(t)
+
+    # ---- Account lists ----
+    for key, label in labels.items():
+        items = sorted(groups[key], key=lambda x: x.get("student_name") or "")
+        if not items:
+            continue
+        story.append(Paragraph(f"{label} ({len(items)})", section_style))
+        data = [["Full Name", "Username"]]
+        for r in items:
+            data.append([
+                Paragraph(str(r.get("student_name") or ""), cell_style),
+                Paragraph(str(r.get("username") or ""), cell_style),
+            ])
+        tbl = Table(data, colWidths=[280, 180], repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#455a64")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#d7dce0")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7f9fa")]),
+            ("PADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(tbl)
+
+    story.append(Spacer(1, 20))
+    story.append(Paragraph("_____________________________", cell_style))
+    story.append(Paragraph("Received by (Principal / Deputy) & Date", cell_style))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
 def create_backup_zip():
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -7944,6 +8176,66 @@ For **every term**, the app expects 3 types of columns:
         else:
             st.write("### Download a full backup")
             st.caption("ZIP with all cloud tables as JSON files.")
+                        st.divider()
+            st.markdown("### 📦 Download Full Backup (3 files)")
+
+            st.info(
+                "**How to use these files:**\n"
+                "- **📊 Excel** — share with the principal. Contains names, usernames, roles. No passwords.\n"
+                "- **🔒 Passwords CSV** — keep offline in a safe. Do not email.\n"
+                "- **🖨️ PDF** — print and file. Contains account list for the school records."
+            )
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                if st.button("📊 Prepare Excel Backup", type="primary", use_container_width=True, key="bk_excel_btn"):
+                    try:
+                        with st.spinner("Building Excel..."):
+                            xlsx = _backup_excel_bytes()
+                        st.download_button(
+                            "⬇️ Download Excel",
+                            data=xlsx,
+                            file_name=f"Backup_{st.session_state.school_name.replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="bk_excel_dl"
+                        )
+                    except Exception as e:
+                        st.error(f"Excel error: {e}")
+
+            with col2:
+                if st.button("🔒 Prepare Passwords CSV", use_container_width=True, key="bk_pw_btn"):
+                    try:
+                        with st.spinner("Building CSV..."):
+                            csv_bytes = _backup_passwords_csv_bytes()
+                        st.download_button(
+                            "⬇️ Download Passwords",
+                            data=csv_bytes,
+                            file_name=f"Passwords_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="bk_pw_dl"
+                        )
+                        st.warning("⚠️ Keep this file offline. Do not email.")
+                    except Exception as e:
+                        st.error(f"CSV error: {e}")
+
+            with col3:
+                if st.button("🖨️ Prepare Summary PDF", use_container_width=True, key="bk_pdf_btn"):
+                    try:
+                        with st.spinner("Building PDF..."):
+                            pdf_bytes = _backup_summary_pdf_bytes()
+                        st.download_button(
+                            "⬇️ Download PDF",
+                            data=pdf_bytes,
+                            file_name=f"Summary_{st.session_state.school_name.replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key="bk_pdf_dl"
+                        )
+                    except Exception as e:
+                        st.error(f"PDF error: {e}")
             
 
             st.divider()
