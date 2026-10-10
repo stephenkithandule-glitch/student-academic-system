@@ -391,7 +391,7 @@ def _bulk_import_users(df, role, name_column, extra_columns=None):
                 extra_payload["student_name"] = ""
             elif role == "teacher":
                 extra_payload["student_name"] = full_name
-                        else:
+            else:
                 extra_payload["student_name"] = full_name
 
             # Write user row
