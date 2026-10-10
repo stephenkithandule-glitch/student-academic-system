@@ -579,19 +579,19 @@ def _bulk_import_subjects(df):
 
     for idx, row in df.iterrows():
         try:
-            subject_name = str(row.get("subject", "")).strip()
+            subject_name = str(row.get("subject", row.get("subjects", ""))).strip()
             if not subject_name or subject_name.lower() == "nan":
                 continue
 
             ppw = 3
             try:
-                ppw = int(row.get("periods per week", 3))
+                ppw = int(row.get("periods per week", row.get("period per week", 3)))
             except Exception:
                 pass
 
-            has_double = str(row.get("has double", "no")).strip().lower() in ["yes", "true", "1", "y"]
-            requires_lab = str(row.get("requires lab", "no")).strip().lower() in ["yes", "true", "1", "y"]
-            lab_type = str(row.get("lab type", "")).strip()
+                        has_double = str(row.get("has double", row.get("has double lesson", "no"))).strip().lower() in ["yes", "true", "1", "y"]
+            requires_lab = str(row.get("requires lab", row.get("required lab", "no"))).strip().lower() in ["yes", "true", "1", "y"]
+            lab_type = str(row.get("lab type", row.get("labtype", ""))).strip()
 
             existing = supabase.table("tt_subjects").select("id").eq("subject_name", subject_name).execute()
             payload = {
@@ -8029,7 +8029,7 @@ For **every term**, the app expects 3 types of columns:
                 st.write(f"**Students:** {len(df)}")
                 st.write(f"**Streams:** {df[stream_col].nunique()}")
 
-            st.success("✅ All data is stored in Supabase — it persists across app restarts.")
+            
 
         # ============================================================
     # TAB 11.5: IT Officer Accounts (admin-only)
