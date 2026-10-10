@@ -298,6 +298,154 @@ def change_user_password(username, new_password):
     }).eq("username", username).execute()
 
 
+# ============================================================
+# BULK IMPORT HELPERS
+# ============================================================
+
+import random
+import string as _string
+
+
+def _slugify_name(full_name):
+    """Turn 'Mr. Peter Kamau' into 'peter.kamau'."""
+    name = str(full_name or "").strip()
+    # Drop common titles
+    for title in ["mr.", "mrs.", "ms.", "miss", "dr.", "prof.", "sir", "madam"]:
+        if name.lower().startswith(title):
+            name = name[len(title):].strip()
+    # Keep only letters, spaces, dots
+    cleaned = "".join(c if (c.isalnum() or c in " .-_") else "" for c in name)
+    parts = [p for p in cleaned.replace("_", " ").replace("-", " ").split() if p]
+    if not parts:
+        return "user"
+    return ".".join(p.lower() for p in parts)
+
+
+def _generate_username(full_name, taken):
+    """Generate a unique username. Appends a number if already taken."""
+    base = _slugify_name(full_name)
+    username = base
+    counter = 1
+    while username.lower() in {t.lower() for t in taken}:
+        counter += 1
+        username = f"{base}{counter}"
+    taken.add(username)
+    return username
+
+
+def _generate_password():
+    """8-character random password with letters and digits."""
+    chars = _string.ascii_letters + _string.digits
+    return "".join(random.choice(chars) for _ in range(8))
+
+
+def _bulk_import_users(df, role, name_column, extra_columns=None):
+    """
+    Bulk-create user accounts from a DataFrame.
+
+    df: pandas DataFrame with at least a name column
+    role: 'teacher' | 'student' | 'parent' | 'clerk' | 'exams' | 'it_officer' | 'admin'
+    name_column: column name that holds the person's full name
+    extra_columns: dict mapping extra logic per role, e.g. {'stream': 'stream'}
+
+    Returns dict: {'created': [...], 'skipped': [...], 'errors': [...]}
+    """
+    created = []
+    skipped = []
+    errors = []
+
+    # Fetch existing usernames to avoid collisions
+    try:
+        existing_rows = supabase.table("users").select("username").execute().data or []
+        taken = {r["username"] for r in existing_rows}
+    except Exception as e:
+        return {"created": [], "skipped": [], "errors": [f"Could not fetch existing users: {e}"]}
+
+    for idx, row in df.iterrows():
+        try:
+            full_name = str(row.get(name_column, "")).strip()
+            if not full_name or full_name.lower() == "nan":
+                continue
+
+            # Username: from Excel if provided, else generated
+            username = str(row.get("username", "")).strip() if "username" in df.columns else ""
+            if not username:
+                username = _generate_username(full_name, taken)
+            elif username.lower() in {t.lower() for t in taken}:
+                skipped.append({"row": idx + 2, "name": full_name, "reason": f"username '{username}' already exists"})
+                continue
+            else:
+                taken.add(username)
+
+            # Password: from Excel if provided, else generated
+            password = str(row.get("password", "")).strip() if "password" in df.columns else ""
+            if not password:
+                password = _generate_password()
+
+            # Role-specific fields
+            extra_payload = {}
+            if role == "student":
+                # student_name for students = full name
+                extra_payload["student_name"] = full_name
+            elif role == "parent":
+                extra_payload["student_name"] = ""
+                # Parent row may have a children column
+                children = str(row.get("children", "")).strip() if "children" in df.columns else ""
+                if children and children.lower() != "nan":
+                    # Also write to parents table
+                    try:
+                        existing_p = supabase.table("parents").select("username").eq("username", username).execute()
+                        if existing_p.data:
+                            supabase.table("parents").update({
+                                "parent_name": full_name,
+                                "child_names": children,
+                            }).eq("username", username).execute()
+                        else:
+                            supabase.table("parents").insert({
+                                "username": username,
+                                "parent_name": full_name,
+                                "child_names": children,
+                            }).execute()
+                    except Exception:
+                        pass
+            else:
+                extra_payload["student_name"] = full_name
+
+            # Write user row
+            try:
+                hashed = hash_password(password)
+                supabase.table("users").insert({
+                    "username": username,
+                    "password": hashed,
+                    "role": role,
+                    **extra_payload,
+                }).execute()
+                created.append({
+                    "row": idx + 2,
+                    "name": full_name,
+                    "username": username,
+                    "password": password,
+                    "role": role,
+                })
+            except Exception as e:
+                errors.append({"row": idx + 2, "name": full_name, "error": str(e)})
+
+        except Exception as e:
+            errors.append({"row": idx + 2, "name": str(row.get(name_column, "")), "error": str(e)})
+
+    return {"created": created, "skipped": skipped, "errors": errors}
+
+
+def _credentials_csv(created_rows):
+    """Turn a list of created-user dicts into a CSV bytes object."""
+    if not created_rows:
+        return b""
+    lines = ["Name,Username,Password,Role"]
+    for r in created_rows:
+        # Escape commas in names by wrapping in quotes
+        name = str(r["name"]).replace('"', '""')
+        lines.append(f'"{name}",{r["username"]},{r["password"]},{r["role"]}')
+    return "\n".join(lines).encode("utf-8")
 def create_or_update_teacher(username, full_name, password):
     hashed = hash_password(password)
     existing = supabase.table("users").select("username").eq("username", username).execute()
