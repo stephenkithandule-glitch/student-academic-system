@@ -1778,10 +1778,12 @@ def tt_generate_timetable(max_seconds=300):
                     double_options.append(pair_var)
             model.Add(sum(double_options) >= 1)
 
-    # Constraint 6: No double free-study blocks, no Free Study on Mon P1 or Fri P1
+            # Constraint 6: No Free Study on Mon P1 or Fri P1 (only if Free Study exists)
     for c in all_classes:
-        model.Add(x[(c, "Free Study", mon_idx, p1_idx)] == 0)
-        model.Add(x[(c, "Free Study", fri_idx, p1_idx)] == 0)
+        if (c, "Free Study", mon_idx, p1_idx) in x:
+            model.Add(x[(c, "Free Study", mon_idx, p1_idx)] == 0)
+        if (c, "Free Study", fri_idx, p1_idx) in x:
+            model.Add(x[(c, "Free Study", fri_idx, p1_idx)] == 0)
 
     # ---- Solve ----
     solver = cp_model.CpSolver()
