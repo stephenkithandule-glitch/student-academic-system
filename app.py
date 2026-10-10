@@ -382,44 +382,46 @@ def _bulk_import_users(df, role, name_column, extra_columns=None):
             if not password:
                 password = _generate_password()
 
-            # Role-specific fields
+                       # Role-specific fields
             extra_payload = {}
             if role == "student":
                 # student_name for students = full name
                 extra_payload["student_name"] = full_name
             elif role == "parent":
                 extra_payload["student_name"] = ""
-                # Parent row may have a children column
-                children = str(row.get("children", "")).strip() if "children" in df.columns else ""
-                if children and children.lower() != "nan":
-                    # Also write to parents table
-                    try:
-                        existing_p = supabase.table("parents").select("username").eq("username", username).execute()
-                        if existing_p.data:
-                            supabase.table("parents").update({
-                                "parent_name": full_name,
-                                "child_names": children,
-                            }).eq("username", username).execute()
+            elif role == "teacher":
+                extra_payload["student_name"] = full_name
                         else:
-                            supabase.table("parents").insert({
-                                "username": username,
-                                "parent_name": full_name,
-                                "child_names": children,
-                            }).execute()
-                    except Exception:
-                        pass
-            else:
                 extra_payload["student_name"] = full_name
 
             # Write user row
             try:
                 hashed = hash_password(password)
+                # 1. Create the login account (users table)
                 supabase.table("users").insert({
                     "username": username,
                     "password": hashed,
                     "role": role,
                     **extra_payload,
                 }).execute()
+
+                # 2. Also create the role-specific row (students/parents/teachers tables)
+                if role == "student":
+                    supabase.table("students").insert({
+                        "username": username,
+                        "student_full_name": full_name,
+                        "created_at": datetime.now().isoformat(),
+                    }).execute()
+                elif role == "parent":
+                    children = str(row.get("children", "")).strip() if "children" in df.columns else ""
+                    supabase.table("parents").insert({
+                        "username": username,
+                        "parent_name": full_name,
+                        "child_names": children,
+                        "created_at": datetime.now().isoformat(),
+                    }).execute()
+                # Teachers don't have a separate table in the current schema
+
                 created.append({
                     "row": idx + 2,
                     "name": full_name,
