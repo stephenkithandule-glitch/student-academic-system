@@ -435,7 +435,7 @@ def _bulk_import_users(df, role, name_column, extra_columns=None):
         except Exception as e:
             errors.append({"row": idx + 2, "name": str(row.get(name_column, "")), "error": str(e)})
 
-        # Debug: show first error if any
+    # Debug: show first error if any
     if errors:
         st.write("**DEBUG — First error from import:**")
         st.write(errors[0])
