@@ -8212,7 +8212,7 @@ For **every term**, the app expects 3 types of columns:
                 "Passwords are auto-generated and shown once after import."
             )
 
-                        import_tab_teachers, import_tab_subjects, import_tab_classes, import_tab_periods, import_tab_students, import_tab_parents = st.tabs([
+            import_tab_teachers, import_tab_subjects, import_tab_classes, import_tab_periods, import_tab_students, import_tab_parents = st.tabs([
                 "👨‍🏫 Teachers",
                 "📖 Subjects",
                 "🏫 Classes",
