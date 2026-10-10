@@ -589,7 +589,7 @@ def _bulk_import_subjects(df):
             except Exception:
                 pass
 
-                        has_double = str(row.get("has double", row.get("has double lesson", "no"))).strip().lower() in ["yes", "true", "1", "y"]
+            has_double = str(row.get("has double", row.get("has double lesson", "no"))).strip().lower() in ["yes", "true", "1", "y"]
             requires_lab = str(row.get("requires lab", row.get("required lab", "no"))).strip().lower() in ["yes", "true", "1", "y"]
             lab_type = str(row.get("lab type", row.get("labtype", ""))).strip()
 
