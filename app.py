@@ -8025,13 +8025,8 @@ For **every term**, the app expects 3 types of columns:
                                 st.success(f"✅ Created {len(result['created'])} teacher accounts.")
                                 if result["skipped"]:
                                     st.warning(f"⚠️ Skipped {len(result['skipped'])} rows (already exist).")
-                                st.error(f"❌ {len(result['errors'])} rows had errors.")
-with st.expander("Show error details"):
-    st.dataframe(
-        pd.DataFrame(result["errors"]),
-        use_container_width=True,
-        hide_index=True,
-    )
+                                if result["errors"]:
+                                    st.error(f"❌ {len(result['errors'])} rows had errors.")
                                 if result["created"]:
                                     csv_bytes = _credentials_csv(result["created"])
                                     st.download_button(
@@ -8041,12 +8036,7 @@ with st.expander("Show error details"):
                                         mime="text/csv",
                                         key="bulk_teacher_csv_dl",
                                     )
-                                    with st.expander("Show created accounts"):
-                                        st.dataframe(
-                                            pd.DataFrame(result["created"]),
-                                            use_container_width=True,
-                                            hide_index=True,
-                                        )
+
                     except Exception as e:
                         st.error(f"Error reading file: {e}")
 
@@ -8096,15 +8086,8 @@ with st.expander("Show error details"):
                                         mime="text/csv",
                                         key="bulk_student_csv_dl",
                                     )
-                                    with st.expander("Show created accounts"):
-                                        st.dataframe(
-                                            pd.DataFrame(result["created"]),
-                                            use_container_width=True,
-                                            hide_index=True,
-                                        )
                     except Exception as e:
                         st.error(f"Error reading file: {e}")
-
             # ---------- PARENTS ----------
             with import_tab_parents:
                 st.markdown("### Upload Parents")
@@ -8151,12 +8134,7 @@ with st.expander("Show error details"):
                                         mime="text/csv",
                                         key="bulk_parent_csv_dl",
                                     )
-                                    with st.expander("Show created accounts"):
-                                        st.dataframe(
-                                            pd.DataFrame(result["created"]),
-                                            use_container_width=True,
-                                            hide_index=True,
-                                        )
+                                    
                     except Exception as e:
                         st.error(f"Error reading file: {e}")
 
