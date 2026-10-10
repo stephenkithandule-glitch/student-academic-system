@@ -7968,6 +7968,191 @@ For **every term**, the app expects 3 types of columns:
             st.write(f"**School:** {st.session_state.school_name}")
             st.write(f"**Academic Year:** {st.session_state.get('academic_year', '')}")
             st.write(f"**Current Term:** {st.session_state.get('current_term', '')}")
+                # ============================================================
+    # TAB 14: Bulk Import
+    # ============================================================
+    with tab_bulk:
+        if st.session_state.user_role not in ["admin", "exams"]:
+            st.info("🔒 Only administrators and examination officers can bulk-import accounts.")
+        else:
+            st.subheader("📥 Bulk Import Accounts")
+            st.caption(
+                "Upload an Excel file to create accounts in bulk. "
+                "Passwords are auto-generated and shown once after import."
+            )
+
+            import_tab_teachers, import_tab_students, import_tab_parents = st.tabs([
+                "👨‍🏫 Teachers",
+                "🎓 Students",
+                "👨‍👩‍👧 Parents",
+            ])
+
+            # ---------- TEACHERS ----------
+            with import_tab_teachers:
+                st.markdown("### Upload Teachers")
+                st.caption(
+                    "Excel columns: **Full Name** (required) · **Username** (optional) · **Password** (optional)"
+                )
+                teacher_file = st.file_uploader(
+                    "Teachers Excel",
+                    type=["xlsx", "xls"],
+                    key="bulk_teacher_file",
+                )
+                if teacher_file is not None:
+                    try:
+                        df_t = pd.read_excel(teacher_file)
+                        df_t.columns = [str(c).strip().lower() for c in df_t.columns]
+                        # Find name column
+                        name_col_t = None
+                        for c in df_t.columns:
+                            if c in ["full name", "name", "teacher name", "full_name"]:
+                                name_col_t = c
+                                break
+                        if name_col_t is None:
+                            st.error(
+                                "Could not find a name column. Use 'Full Name' or 'Name' as a column header."
+                            )
+                        else:
+                            st.write(f"**Detected {len(df_t)} rows.** Preview:")
+                            st.dataframe(df_t.head(5), use_container_width=True, hide_index=True)
+
+                            if st.button("🚀 Import Teachers", type="primary", key="bulk_import_teachers_btn"):
+                                with st.spinner("Creating teacher accounts..."):
+                                    result = _bulk_import_users(df_t, "teacher", name_col_t)
+
+                                st.success(f"✅ Created {len(result['created'])} teacher accounts.")
+                                if result["skipped"]:
+                                    st.warning(f"⚠️ Skipped {len(result['skipped'])} rows (already exist).")
+                                if result["errors"]:
+                                    st.error(f"❌ {len(result['errors'])} rows had errors.")
+
+                                if result["created"]:
+                                    csv_bytes = _credentials_csv(result["created"])
+                                    st.download_button(
+                                        "⬇️ Download Credentials CSV",
+                                        data=csv_bytes,
+                                        file_name=f"Teacher_Credentials_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                                        mime="text/csv",
+                                        key="bulk_teacher_csv_dl",
+                                    )
+                                    with st.expander("Show created accounts"):
+                                        st.dataframe(
+                                            pd.DataFrame(result["created"]),
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+
+            # ---------- STUDENTS ----------
+            with import_tab_students:
+                st.markdown("### Upload Students")
+                st.caption(
+                    "Excel columns: **Full Name** (required) · **Stream** (optional) · "
+                    "**Username** (optional) · **Password** (optional)"
+                )
+                student_file = st.file_uploader(
+                    "Students Excel",
+                    type=["xlsx", "xls"],
+                    key="bulk_student_file",
+                )
+                if student_file is not None:
+                    try:
+                        df_s = pd.read_excel(student_file)
+                        df_s.columns = [str(c).strip().lower() for c in df_s.columns]
+                        name_col_s = None
+                        for c in df_s.columns:
+                            if c in ["full name", "name", "student name", "full_name"]:
+                                name_col_s = c
+                                break
+                        if name_col_s is None:
+                            st.error("Could not find a name column. Use 'Full Name' or 'Name'.")
+                        else:
+                            st.write(f"**Detected {len(df_s)} rows.** Preview:")
+                            st.dataframe(df_s.head(5), use_container_width=True, hide_index=True)
+
+                            if st.button("🚀 Import Students", type="primary", key="bulk_import_students_btn"):
+                                with st.spinner("Creating student accounts..."):
+                                    result = _bulk_import_users(df_s, "student", name_col_s)
+
+                                st.success(f"✅ Created {len(result['created'])} student accounts.")
+                                if result["skipped"]:
+                                    st.warning(f"⚠️ Skipped {len(result['skipped'])} rows.")
+                                if result["errors"]:
+                                    st.error(f"❌ {len(result['errors'])} rows had errors.")
+
+                                if result["created"]:
+                                    csv_bytes = _credentials_csv(result["created"])
+                                    st.download_button(
+                                        "⬇️ Download Credentials CSV",
+                                        data=csv_bytes,
+                                        file_name=f"Student_Credentials_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                                        mime="text/csv",
+                                        key="bulk_student_csv_dl",
+                                    )
+                                    with st.expander("Show created accounts"):
+                                        st.dataframe(
+                                            pd.DataFrame(result["created"]),
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+
+            # ---------- PARENTS ----------
+            with import_tab_parents:
+                st.markdown("### Upload Parents")
+                st.caption(
+                    "Excel columns: **Full Name** (required) · **Children** (optional, pipe-separated) · "
+                    "**Username** (optional) · **Password** (optional)"
+                )
+                parent_file = st.file_uploader(
+                    "Parents Excel",
+                    type=["xlsx", "xls"],
+                    key="bulk_parent_file",
+                )
+                if parent_file is not None:
+                    try:
+                        df_p = pd.read_excel(parent_file)
+                        df_p.columns = [str(c).strip().lower() for c in df_p.columns]
+                        name_col_p = None
+                        for c in df_p.columns:
+                            if c in ["full name", "name", "parent name", "full_name", "guardian name"]:
+                                name_col_p = c
+                                break
+                        if name_col_p is None:
+                            st.error("Could not find a name column. Use 'Full Name' or 'Name'.")
+                        else:
+                            st.write(f"**Detected {len(df_p)} rows.** Preview:")
+                            st.dataframe(df_p.head(5), use_container_width=True, hide_index=True)
+
+                            if st.button("🚀 Import Parents", type="primary", key="bulk_import_parents_btn"):
+                                with st.spinner("Creating parent accounts..."):
+                                    result = _bulk_import_users(df_p, "parent", name_col_p)
+
+                                st.success(f"✅ Created {len(result['created'])} parent accounts.")
+                                if result["skipped"]:
+                                    st.warning(f"⚠️ Skipped {len(result['skipped'])} rows.")
+                                if result["errors"]:
+                                    st.error(f"❌ {len(result['errors'])} rows had errors.")
+
+                                if result["created"]:
+                                    csv_bytes = _credentials_csv(result["created"])
+                                    st.download_button(
+                                        "⬇️ Download Credentials CSV",
+                                        data=csv_bytes,
+                                        file_name=f"Parent_Credentials_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                                        mime="text/csv",
+                                        key="bulk_parent_csv_dl",
+                                    )
+                                    with st.expander("Show created accounts"):
+                                        st.dataframe(
+                                            pd.DataFrame(result["created"]),
+                                            use_container_width=True,
+                                            hide_index=True,
+                                        )
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
 
             if db_ok:
                 st.success("✅ All systems operational.")
