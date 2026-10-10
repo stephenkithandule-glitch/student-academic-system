@@ -8026,8 +8026,13 @@ For **every term**, the app expects 3 types of columns:
                                 if result["skipped"]:
                                     st.warning(f"⚠️ Skipped {len(result['skipped'])} rows (already exist).")
                                 if result["errors"]:
-                                    st.error(f"❌ {len(result['errors'])} rows had errors.")
-
+    st.error(f"❌ {len(result['errors'])} rows had errors.")
+    with st.expander("Show error details"):
+        st.dataframe(
+            pd.DataFrame(result["errors"]),
+            use_container_width=True,
+            hide_index=True,
+        )
                                 if result["created"]:
                                     csv_bytes = _credentials_csv(result["created"])
                                     st.download_button(
