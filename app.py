@@ -436,6 +436,237 @@ def _bulk_import_users(df, role, name_column, extra_columns=None):
     return {"created": created, "skipped": skipped, "errors": errors}
 
 
+def _ensure_class_exists(class_name):
+    """Create a class in tt_class_teacher if it doesn't exist."""
+    try:
+        existing = supabase.table("tt_class_teacher").select("id").eq("class_name", class_name).limit(1).execute()
+        if existing.data:
+            return True
+        supabase.table("tt_class_teacher").insert({
+            "class_name": class_name,
+            "subject_name": "FREE",
+            "teacher_id": None,
+            "periods_per_week": 0,
+        }).execute()
+        return True
+    except Exception as e:
+        return str(e)
+
+
+def _ensure_subject_exists(subject_name, periods_per_week=3):
+    """Create a subject in tt_subjects if it doesn't exist."""
+    try:
+        existing = supabase.table("tt_subjects").select("id").eq("subject_name", subject_name).execute()
+        if existing.data:
+            return True
+        supabase.table("tt_subjects").insert({
+            "subject_name": subject_name,
+            "periods_per_week": int(periods_per_week),
+            "has_double": False,
+            "double_count": 0,
+            "requires_lab": False,
+            "lab_type": None,
+        }).execute()
+        return True
+    except Exception as e:
+        return str(e)
+
+
+def _assign_teacher_to_class(teacher_full_name, subject_name, class_name, periods_per_week=3):
+    """Create/update a tt_class_teacher row linking teacher + subject + class."""
+    try:
+        t = supabase.table("tt_teachers").select("id").eq("full_name", teacher_full_name).execute()
+        if not t.data:
+            return f"Teacher {teacher_full_name} not found in tt_teachers"
+        teacher_id = t.data[0]["id"]
+
+        _ensure_subject_exists(subject_name, periods_per_week)
+
+        existing = supabase.table("tt_class_teacher").select("id").eq("class_name", class_name).eq("subject_name", subject_name).execute()
+        if existing.data:
+            supabase.table("tt_class_teacher").update({
+                "teacher_id": teacher_id,
+                "periods_per_week": int(periods_per_week),
+            }).eq("id", existing.data[0]["id"]).execute()
+        else:
+            supabase.table("tt_class_teacher").insert({
+                "class_name": class_name,
+                "subject_name": subject_name,
+                "teacher_id": teacher_id,
+                "periods_per_week": int(periods_per_week),
+            }).execute()
+        return True
+    except Exception as e:
+        return str(e)
+
+
+def _bulk_import_teachers_full(df):
+    """
+    Import teachers: create login account + tt_teachers row + class assignments.
+    Expected columns: Full Name, Subjects (optional, comma-sep), Classes (optional, pipe-sep)
+    """
+    created = []
+    skipped = []
+    errors = []
+
+    try:
+        existing_rows = supabase.table("users").select("username").execute().data or []
+        taken = {r["username"] for r in existing_rows}
+    except Exception as e:
+        return {"created": [], "skipped": [], "errors": [f"Could not fetch existing users: {e}"]}
+
+    for idx, row in df.iterrows():
+        try:
+            full_name = str(row.get("full name", row.get("name", ""))).strip()
+            if not full_name or full_name.lower() == "nan":
+                continue
+
+            subjects_raw = str(row.get("subjects", "")).strip() if "subjects" in df.columns else ""
+            classes_raw = str(row.get("classes", "")).strip() if "classes" in df.columns else ""
+
+            username = _generate_username(full_name, taken)
+            taken.add(username)
+            password = _generate_password()
+
+            supabase.table("users").insert({
+                "username": username,
+                "password": hash_password(password),
+                "role": "teacher",
+                "student_name": full_name,
+            }).execute()
+
+            existing_tt = supabase.table("tt_teachers").select("id").eq("full_name", full_name).execute()
+            if not existing_tt.data:
+                supabase.table("tt_teachers").insert({
+                    "full_name": full_name,
+                    "subjects_taught": subjects_raw,
+                    "max_periods_per_day": 6,
+                }).execute()
+
+            assignment_log = []
+            if subjects_raw and classes_raw:
+                subject_list = [s.strip() for s in subjects_raw.split(",") if s.strip()]
+                class_list = [c.strip() for c in classes_raw.split("|") if c.strip()]
+
+                for cls in class_list:
+                    _ensure_class_exists(cls)
+                    for subj in subject_list:
+                        result = _assign_teacher_to_class(full_name, subj, cls, 3)
+                        if result is True:
+                            assignment_log.append(f"{subj}->{cls}")
+
+            created.append({
+                "row": idx + 2,
+                "name": full_name,
+                "username": username,
+                "password": password,
+                "role": "teacher",
+                "subjects": subjects_raw,
+                "classes": classes_raw,
+                "assignments_created": len(assignment_log),
+            })
+
+        except Exception as e:
+            errors.append({"row": idx + 2, "name": str(row.get("full name", row.get("name", ""))), "error": str(e)})
+
+    return {"created": created, "skipped": skipped, "errors": errors}
+
+
+def _bulk_import_subjects(df):
+    """Import subjects into tt_subjects."""
+    created = []
+    errors = []
+
+    for idx, row in df.iterrows():
+        try:
+            subject_name = str(row.get("subject", "")).strip()
+            if not subject_name or subject_name.lower() == "nan":
+                continue
+
+            ppw = 3
+            try:
+                ppw = int(row.get("periods per week", 3))
+            except Exception:
+                pass
+
+            has_double = str(row.get("has double", "no")).strip().lower() in ["yes", "true", "1", "y"]
+            requires_lab = str(row.get("requires lab", "no")).strip().lower() in ["yes", "true", "1", "y"]
+            lab_type = str(row.get("lab type", "")).strip()
+
+            existing = supabase.table("tt_subjects").select("id").eq("subject_name", subject_name).execute()
+            payload = {
+                "subject_name": subject_name,
+                "periods_per_week": ppw,
+                "has_double": has_double,
+                "double_count": 1 if has_double else 0,
+                "requires_lab": requires_lab,
+                "lab_type": lab_type or None,
+            }
+            if existing.data:
+                supabase.table("tt_subjects").update(payload).eq("id", existing.data[0]["id"]).execute()
+                created.append({"subject": subject_name, "action": "updated"})
+            else:
+                supabase.table("tt_subjects").insert(payload).execute()
+                created.append({"subject": subject_name, "action": "created"})
+        except Exception as e:
+            errors.append({"row": idx + 2, "subject": str(row.get("subject", "")), "error": str(e)})
+
+    return {"created": created, "errors": errors}
+
+
+def _bulk_import_classes(df):
+    """Import classes into tt_class_teacher."""
+    created = []
+    errors = []
+
+    for idx, row in df.iterrows():
+        try:
+            class_name = str(row.get("class name", "")).strip().upper()
+            if not class_name or class_name.lower() == "nan":
+                continue
+            result = _ensure_class_exists(class_name)
+            if result is True:
+                created.append({"class": class_name})
+            else:
+                errors.append({"row": idx + 2, "class": class_name, "error": str(result)})
+        except Exception as e:
+            errors.append({"row": idx + 2, "class": str(row.get("class name", "")), "error": str(e)})
+
+    return {"created": created, "errors": errors}
+
+
+def _bulk_import_periods(df):
+    """Import periods into tt_periods."""
+    created = []
+    errors = []
+
+    for idx, row in df.iterrows():
+        try:
+            pno = int(row.get("period no", 0))
+            if pno <= 0:
+                continue
+            start = str(row.get("start time", "")).strip()
+            end = str(row.get("end time", "")).strip()
+            existing = supabase.table("tt_periods").select("id").eq("period_no", pno).execute()
+            payload = {
+                "period_no": pno,
+                "start_time": start,
+                "end_time": end,
+                "is_break": False,
+                "break_label": None,
+            }
+            if existing.data:
+                supabase.table("tt_periods").update(payload).eq("id", existing.data[0]["id"]).execute()
+                created.append({"period": pno, "action": "updated"})
+            else:
+                supabase.table("tt_periods").insert(payload).execute()
+                created.append({"period": pno, "action": "created"})
+        except Exception as e:
+            errors.append({"row": idx + 2, "period": str(row.get("period no", "")), "error": str(e)})
+
+    return {"created": created, "errors": errors}
+
+
 def _credentials_csv(created_rows):
     """Turn a list of created-user dicts into a CSV bytes object."""
     if not created_rows:
