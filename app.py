@@ -6833,10 +6833,7 @@ elif page == "🤖 AI Advisor":
 
 
 
-elif page == "Settings":
-    st.subheader("School Profile & System Settings")
-
-    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_exams, tab_admins, tab_tt_setup, tab_ito, tab_backup, tab_health = st.tabs([
+    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_exams, tab_admins, tab_tt_setup, tab_ito, tab_backup, tab_bulk, tab_health = st.tabs([
         "🏫 School Profile",
         "🔒 Change Password",
         "👨‍🏫 Teacher Accounts",
@@ -6849,6 +6846,7 @@ elif page == "Settings":
         "⚙️ Timetable Setup",
         "🖥️ IT Officer Accounts",
         "💾 Backup & Data",
+        "📥 Bulk Import",
         "🖥️ System Health"
     ])
 
