@@ -8212,12 +8212,14 @@ For **every term**, the app expects 3 types of columns:
                 "Passwords are auto-generated and shown once after import."
             )
 
-            import_tab_teachers, import_tab_students, import_tab_parents = st.tabs([
+                        import_tab_teachers, import_tab_subjects, import_tab_classes, import_tab_periods, import_tab_students, import_tab_parents = st.tabs([
                 "👨‍🏫 Teachers",
+                "📖 Subjects",
+                "🏫 Classes",
+                "🕐 Periods",
                 "🎓 Students",
                 "👨‍👩‍👧 Parents",
             ])
-
                         # ---------- TEACHERS ----------
             with import_tab_teachers:
                 st.markdown("### Upload Teachers")
@@ -8268,6 +8270,72 @@ For **every term**, the app expects 3 types of columns:
                                         mime="text/csv",
                                         key="bulk_teacher_csv_dl",
                                     )
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+
+                        # ---------- SUBJECTS ----------
+            with import_tab_subjects:
+                st.markdown("### Upload Subjects")
+                st.caption(
+                    "Excel columns: **Subject** · **Periods Per Week** · "
+                    "**Has Double** (yes/no) · **Requires Lab** (yes/no) · **Lab Type**"
+                )
+                subject_file = st.file_uploader("Subjects Excel", type=["xlsx", "xls"], key="bulk_subject_file")
+                if subject_file is not None:
+                    try:
+                        df_sub = pd.read_excel(subject_file)
+                        df_sub.columns = [str(c).strip().lower() for c in df_sub.columns]
+                        st.write(f"**Detected {len(df_sub)} rows.** Preview:")
+                        st.dataframe(df_sub.head(5), use_container_width=True, hide_index=True)
+
+                        if st.button("🚀 Import Subjects", type="primary", key="bulk_import_subjects_btn"):
+                            with st.spinner("Creating subjects..."):
+                                result = _bulk_import_subjects(df_sub)
+                            st.success(f"✅ Imported {len(result['created'])} subjects.")
+                            if result["errors"]:
+                                st.error(f"❌ {len(result['errors'])} rows had errors.")
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+
+            # ---------- CLASSES ----------
+            with import_tab_classes:
+                st.markdown("### Upload Classes")
+                st.caption("Excel columns: **Class Name**")
+                class_file = st.file_uploader("Classes Excel", type=["xlsx", "xls"], key="bulk_class_file")
+                if class_file is not None:
+                    try:
+                        df_cls = pd.read_excel(class_file)
+                        df_cls.columns = [str(c).strip().lower() for c in df_cls.columns]
+                        st.write(f"**Detected {len(df_cls)} rows.** Preview:")
+                        st.dataframe(df_cls.head(5), use_container_width=True, hide_index=True)
+
+                        if st.button("🚀 Import Classes", type="primary", key="bulk_import_classes_btn"):
+                            with st.spinner("Creating classes..."):
+                                result = _bulk_import_classes(df_cls)
+                            st.success(f"✅ Imported {len(result['created'])} classes.")
+                            if result["errors"]:
+                                st.error(f"❌ {len(result['errors'])} rows had errors.")
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+
+            # ---------- PERIODS ----------
+            with import_tab_periods:
+                st.markdown("### Upload Periods")
+                st.caption("Excel columns: **Period No** · **Start Time** · **End Time**")
+                period_file = st.file_uploader("Periods Excel", type=["xlsx", "xls"], key="bulk_period_file")
+                if period_file is not None:
+                    try:
+                        df_per = pd.read_excel(period_file)
+                        df_per.columns = [str(c).strip().lower() for c in df_per.columns]
+                        st.write(f"**Detected {len(df_per)} rows.** Preview:")
+                        st.dataframe(df_per.head(5), use_container_width=True, hide_index=True)
+
+                        if st.button("🚀 Import Periods", type="primary", key="bulk_import_periods_btn"):
+                            with st.spinner("Creating periods..."):
+                                result = _bulk_import_periods(df_per)
+                            st.success(f"✅ Imported {len(result['created'])} periods.")
+                            if result["errors"]:
+                                st.error(f"❌ {len(result['errors'])} rows had errors.")
                     except Exception as e:
                         st.error(f"Error reading file: {e}")
 
