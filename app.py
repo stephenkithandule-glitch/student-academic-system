@@ -298,6 +298,310 @@ def change_user_password(username, new_password):
     }).eq("username", username).execute()
 
 
+# ============================================================
+# BULK IMPORT HELPERS
+# ============================================================
+
+import random
+import string as _string
+
+
+def _slugify_name(full_name):
+    """Turn 'Mr. Peter Kamau' into 'peter.kamau'."""
+    name = str(full_name or "").strip()
+    # Drop common titles
+    for title in ["mr.", "mrs.", "ms.", "miss", "dr.", "prof.", "sir", "madam"]:
+        if name.lower().startswith(title):
+            name = name[len(title):].strip()
+    # Keep only letters, spaces, dots
+    cleaned = "".join(c if (c.isalnum() or c in " .-_") else "" for c in name)
+    parts = [p for p in cleaned.replace("_", " ").replace("-", " ").split() if p]
+    if not parts:
+        return "user"
+    return ".".join(p.lower() for p in parts)
+
+
+def _generate_username(full_name, taken):
+    """Generate a unique username. Appends a number if already taken."""
+    base = _slugify_name(full_name)
+    username = base
+    counter = 1
+    while username.lower() in {t.lower() for t in taken}:
+        counter += 1
+        username = f"{base}{counter}"
+    taken.add(username)
+    return username
+
+
+def _generate_password():
+    """8-character random password with letters and digits."""
+    chars = _string.ascii_letters + _string.digits
+    return "".join(random.choice(chars) for _ in range(8))
+
+
+def _bulk_import_users(df, role, name_column, extra_columns=None):
+    """
+    Bulk-create user accounts from a DataFrame.
+
+    df: pandas DataFrame with at least a name column
+    role: 'teacher' | 'student' | 'parent' | 'clerk' | 'exams' | 'it_officer' | 'admin'
+    name_column: column name that holds the person's full name
+    extra_columns: dict mapping extra logic per role, e.g. {'stream': 'stream'}
+
+    Returns dict: {'created': [...], 'skipped': [...], 'errors': [...]}
+    """
+    created = []
+    skipped = []
+    errors = []
+
+    # Fetch existing usernames to avoid collisions
+    try:
+        existing_rows = supabase.table("users").select("username").execute().data or []
+        taken = {r["username"] for r in existing_rows}
+    except Exception as e:
+        return {"created": [], "skipped": [], "errors": [f"Could not fetch existing users: {e}"]}
+
+    for idx, row in df.iterrows():
+        try:
+            full_name = str(row.get(name_column, "")).strip()
+            if not full_name or full_name.lower() == "nan":
+                continue
+
+            # Username: from Excel if provided, else generated
+            username = str(row.get("username", "")).strip() if "username" in df.columns else ""
+            if not username:
+                username = _generate_username(full_name, taken)
+            elif username.lower() in {t.lower() for t in taken}:
+                skipped.append({"row": idx + 2, "name": full_name, "reason": f"username '{username}' already exists"})
+                continue
+            else:
+                taken.add(username)
+
+            # Password: from Excel if provided, else generated
+            password = str(row.get("password", "")).strip() if "password" in df.columns else ""
+            if not password:
+                password = _generate_password()
+
+            # Role-specific fields
+            extra_payload = {}
+            if role == "student":
+                # student_name for students = full name
+                extra_payload["student_name"] = full_name
+            elif role == "parent":
+                extra_payload["student_name"] = ""
+                # Parent row may have a children column
+                children = str(row.get("children", "")).strip() if "children" in df.columns else ""
+                if children and children.lower() != "nan":
+                    # Also write to parents table
+                    try:
+                        existing_p = supabase.table("parents").select("username").eq("username", username).execute()
+                        if existing_p.data:
+                            supabase.table("parents").update({
+                                "parent_name": full_name,
+                                "child_names": children,
+                            }).eq("username", username).execute()
+                        else:
+                            supabase.table("parents").insert({
+                                "username": username,
+                                "parent_name": full_name,
+                                "child_names": children,
+                            }).execute()
+                    except Exception:
+                        pass
+            else:
+                extra_payload["student_name"] = full_name
+
+            # Write user row
+            try:
+                hashed = hash_password(password)
+                supabase.table("users").insert({
+                    "username": username,
+                    "password": hashed,
+                    "role": role,
+                    **extra_payload,
+                }).execute()
+                created.append({
+                    "row": idx + 2,
+                    "name": full_name,
+                    "username": username,
+                    "password": password,
+                    "role": role,
+                })
+            except Exception as e:
+                errors.append({"row": idx + 2, "name": full_name, "error": str(e)})
+
+        except Exception as e:
+            errors.append({"row": idx + 2, "name": str(row.get(name_column, "")), "error": str(e)})
+
+    return {"created": created, "skipped": skipped, "errors": errors}
+
+
+def _ensure_class_exists(class_name):
+    """Create a class in tt_class_teacher if it doesn't exist."""
+    try:
+        existing = supabase.table("tt_class_teacher").select("id").eq("class_name", class_name).limit(1).execute()
+        if existing.data:
+            return True
+        supabase.table("tt_class_teacher").insert({
+            "class_name": class_name,
+            "subject_name": "FREE",
+            "teacher_id": None,
+            "periods_per_week": 0,
+        }).execute()
+        return True
+    except Exception as e:
+        return str(e)
+
+
+def _ensure_subject_exists(subject_name, periods_per_week=3):
+    """Create a subject in tt_subjects if it doesn't exist."""
+    try:
+        existing = supabase.table("tt_subjects").select("id").eq("subject_name", subject_name).execute()
+        if existing.data:
+            return True
+        supabase.table("tt_subjects").insert({
+            "subject_name": subject_name,
+            "periods_per_week": int(periods_per_week),
+            "has_double": False,
+            "double_count": 0,
+            "requires_lab": False,
+            "lab_type": None,
+        }).execute()
+        return True
+    except Exception as e:
+        return str(e)
+
+
+def _assign_teacher_to_class(teacher_full_name, subject_name, class_name, periods_per_week=3):
+    """Create/update a tt_class_teacher row linking teacher + subject + class."""
+    try:
+        t = supabase.table("tt_teachers").select("id").eq("full_name", teacher_full_name).execute()
+        if not t.data:
+            return f"Teacher {teacher_full_name} not found in tt_teachers"
+        teacher_id = t.data[0]["id"]
+
+        _ensure_subject_exists(subject_name, periods_per_week)
+
+        existing = supabase.table("tt_class_teacher").select("id").eq("class_name", class_name).eq("subject_name", subject_name).execute()
+        if existing.data:
+            supabase.table("tt_class_teacher").update({
+                "teacher_id": teacher_id,
+                "periods_per_week": int(periods_per_week),
+            }).eq("id", existing.data[0]["id"]).execute()
+        else:
+            supabase.table("tt_class_teacher").insert({
+                "class_name": class_name,
+                "subject_name": subject_name,
+                "teacher_id": teacher_id,
+                "periods_per_week": int(periods_per_week),
+            }).execute()
+        return True
+    except Exception as e:
+        return str(e)
+
+
+def _bulk_import_subjects(df):
+    """Import subjects into tt_subjects. Accepts multiple column name variants."""
+    created = []
+    errors = []
+
+    # Normalize column names
+    df.columns = [str(c).strip().lower() for c in df.columns]
+
+    # Map the various column names you might use to canonical ones
+    rename_map = {}
+    for c in df.columns:
+        if c in ["subject", "subjects", "subject name"]:
+            rename_map[c] = "subject"
+        elif c in ["periods per week", "period per week", "periods/week", "ppw"]:
+            rename_map[c] = "periods per week"
+        elif c in ["has double", "has double lesson", "double"]:
+            rename_map[c] = "has double"
+        elif c in ["requires lab", "required lab", "lab"]:
+            rename_map[c] = "requires lab"
+        elif c in ["lab type", "labtype", "lab name"]:
+            rename_map[c] = "lab type"
+    df = df.rename(columns=rename_map)
+
+    for idx, row in df.iterrows():
+        try:
+            subject_name = str(row.get("subject", "")).strip()
+            if not subject_name or subject_name.lower() == "nan":
+                continue
+
+            ppw = 3
+            try:
+                ppw = int(row.get("periods per week", 3))
+            except Exception:
+                pass
+
+            has_double = str(row.get("has double", "no")).strip().lower() in ["yes", "true", "1", "y"]
+            requires_lab = str(row.get("requires lab", "no")).strip().lower() in ["yes", "true", "1", "y"]
+            lab_type = str(row.get("lab type", "")).strip()
+
+            existing = supabase.table("tt_subjects").select("id").eq("subject_name", subject_name).execute()
+            payload = {
+                "subject_name": subject_name,
+                "periods_per_week": ppw,
+                "has_double": has_double,
+                "double_count": 1 if has_double else 0,
+                "requires_lab": requires_lab,
+                "lab_type": lab_type or None,
+            }
+            if existing.data:
+                supabase.table("tt_subjects").update(payload).eq("id", existing.data[0]["id"]).execute()
+                created.append({"subject": subject_name, "action": "updated"})
+            else:
+                supabase.table("tt_subjects").insert(payload).execute()
+                created.append({"subject": subject_name, "action": "created"})
+        except Exception as e:
+            errors.append({"row": idx + 2, "subject": str(row.get("subject", "")), "error": str(e)})
+
+    return {"created": created, "errors": errors}
+
+
+def _bulk_import_periods(df):
+    """Import periods into tt_periods."""
+    created = []
+    errors = []
+
+    for idx, row in df.iterrows():
+        try:
+            pno = int(row.get("period no", 0))
+            if pno <= 0:
+                continue
+            start = str(row.get("start time", "")).strip()
+            end = str(row.get("end time", "")).strip()
+            existing = supabase.table("tt_periods").select("id").eq("period_no", pno).execute()
+            payload = {
+                "period_no": pno,
+                "start_time": start,
+                "end_time": end,
+                "is_break": False,
+                "break_label": None,
+            }
+            if existing.data:
+                supabase.table("tt_periods").update(payload).eq("id", existing.data[0]["id"]).execute()
+                created.append({"period": pno, "action": "updated"})
+            else:
+                supabase.table("tt_periods").insert(payload).execute()
+                created.append({"period": pno, "action": "created"})
+        except Exception as e:
+            errors.append({"row": idx + 2, "period": str(row.get("period no", "")), "error": str(e)})
+
+    return {"created": created, "errors": errors}
+
+
+def _credentials_csv(created_rows):
+    """Turn a list of created-user dicts into a CSV bytes object."""
+    if not created_rows:
+        return b""
+    lines = ["Name,Username,Password,Role"]
+    for r in created_rows:
+        # Escape commas in names by wrapping in quotes
+        name = str(r["name"]).replace('"', '""')
+        lines.append(f'"{name}",{r["username"]},{r["password"]},{r["role"]}')
+    return "\n".join(lines).encode("utf-8")
 def create_or_update_teacher(username, full_name, password):
     hashed = hash_password(password)
     existing = supabase.table("users").select("username").eq("username", username).execute()
@@ -1399,10 +1703,12 @@ def tt_generate_timetable(max_seconds=300):
                     double_options.append(pair_var)
             model.Add(sum(double_options) >= 1)
 
-    # Constraint 6: No double free-study blocks, no Free Study on Mon P1 or Fri P1
+            # Constraint 6: No Free Study on Mon P1 or Fri P1 (only if Free Study exists)
     for c in all_classes:
-        model.Add(x[(c, "Free Study", mon_idx, p1_idx)] == 0)
-        model.Add(x[(c, "Free Study", fri_idx, p1_idx)] == 0)
+        if (c, "Free Study", mon_idx, p1_idx) in x:
+            model.Add(x[(c, "Free Study", mon_idx, p1_idx)] == 0)
+        if (c, "Free Study", fri_idx, p1_idx) in x:
+            model.Add(x[(c, "Free Study", fri_idx, p1_idx)] == 0)
 
     # ---- Solve ----
     solver = cp_model.CpSolver()
@@ -2975,6 +3281,238 @@ def generate_all_student_pdfs(data, school_name):
 
 
 # ============================================================
+def _backup_excel_bytes():
+    """Build an Excel workbook with one sheet per role. No passwords."""
+    import openpyxl
+    from io import BytesIO
+
+    buf = BytesIO()
+
+    # Fetch all users
+    try:
+        rows = supabase.table("users").select("username,role,student_name").execute().data or []
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch users: {e}")
+
+    # Fetch parents (child links)
+    parents_map = {}
+    try:
+        prows = supabase.table("parents").select("username,parent_name,child_names").execute().data or []
+        for p in prows:
+            parents_map[p["username"]] = p.get("child_names") or ""
+    except Exception:
+        pass
+
+    # Group by role
+    groups = {
+        "Admins": [],
+        "Teachers": [],
+        "Students": [],
+        "Parents": [],
+        "Clerks": [],
+        "Exams Officers": [],
+        "IT Officers": [],
+    }
+    for r in rows:
+        role = (r.get("role") or "").lower()
+        if role == "admin":
+            groups["Admins"].append(r)
+        elif role == "teacher":
+            groups["Teachers"].append(r)
+        elif role == "student":
+            groups["Students"].append(r)
+        elif role == "parent":
+            groups["Parents"].append(r)
+        elif role == "clerk":
+            groups["Clerks"].append(r)
+        elif role == "exams":
+            groups["Exams Officers"].append(r)
+        elif role == "it_officer":
+            groups["IT Officers"].append(r)
+
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)  # drop default sheet
+
+    # ---- Summary sheet ----
+    ws = wb.create_sheet("Summary")
+    ws.append(["SCHOOL BACKUP SUMMARY"])
+    ws.append([])
+    ws.append(["School", st.session_state.get("school_name", "")])
+    ws.append(["Generated", datetime.now().strftime("%d %B %Y at %H:%M")])
+    ws.append([])
+    ws.append(["Role", "Count"])
+    total = 0
+    for label, items in groups.items():
+        ws.append([label, len(items)])
+        total += len(items)
+    ws.append([])
+    ws.append(["TOTAL", total])
+    ws.column_dimensions["A"].width = 25
+    ws.column_dimensions["B"].width = 40
+
+    # ---- One sheet per group ----
+    for label, items in groups.items():
+        if not items:
+            continue
+        ws = wb.create_sheet(label[:31])  # Excel sheet name limit
+
+        if label == "Parents":
+            ws.append(["Full Name", "Username", "Children"])
+            for r in sorted(items, key=lambda x: x.get("student_name") or ""):
+                ws.append([
+                    r.get("student_name") or "",
+                    r.get("username") or "",
+                    parents_map.get(r.get("username"), ""),
+                ])
+        else:
+            ws.append(["Full Name", "Username"])
+            for r in sorted(items, key=lambda x: x.get("student_name") or ""):
+                ws.append([
+                    r.get("student_name") or "",
+                    r.get("username") or "",
+                ])
+
+        # Column widths
+        ws.column_dimensions["A"].width = 35
+        ws.column_dimensions["B"].width = 30
+        if label == "Parents":
+            ws.column_dimensions["C"].width = 40
+
+    wb.save(buf)
+    buf.seek(0)
+    return buf.getvalue()
+
+
+def _backup_passwords_csv_bytes():
+    """Build a CSV with username + password hash. Sensitive — do not share."""
+    try:
+        rows = supabase.table("users").select("username,password,role").execute().data or []
+    except Exception as e:
+        raise RuntimeError(f"Could not fetch users: {e}")
+
+    lines = ["Username,Password Hash,Role"]
+    for r in sorted(rows, key=lambda x: x.get("username") or ""):
+        username = str(r.get("username") or "").replace(",", "")
+        pw = str(r.get("password") or "").replace(",", "")
+        role = str(r.get("role") or "")
+        lines.append(f"{username},{pw},{role}")
+    return "\n".join(lines).encode("utf-8")
+
+
+def _backup_summary_pdf_bytes():
+    """Build a one-page printable PDF summary of the school's accounts."""
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib import colors
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer
+    import io as _io
+
+    buf = _io.BytesIO()
+    doc = SimpleDocTemplate(
+        buf, pagesize=A4,
+        leftMargin=30, rightMargin=30, topMargin=30, bottomMargin=30
+    )
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "TitleX", parent=styles["Heading1"],
+        fontName="Helvetica-Bold", fontSize=16, leading=20, alignment=1
+    )
+    subtitle_style = ParagraphStyle(
+        "SubX", parent=styles["Normal"],
+        fontSize=10, leading=12, alignment=1,
+        textColor=colors.HexColor("#555555")
+    )
+    section_style = ParagraphStyle(
+        "SectionX", parent=styles["Normal"],
+        fontName="Helvetica-Bold", fontSize=12, leading=14,
+        spaceBefore=10, spaceAfter=4
+    )
+    cell_style = ParagraphStyle(
+        "CellX", parent=styles["Normal"], fontSize=9, leading=11
+    )
+
+    try:
+        rows = supabase.table("users").select("username,role,student_name").execute().data or []
+    except Exception:
+        rows = []
+
+    groups = {"admin": [], "teacher": [], "student": [], "parent": [], "clerk": [], "exams": [], "it_officer": []}
+    for r in rows:
+        role = (r.get("role") or "").lower()
+        if role in groups:
+            groups[role].append(r)
+
+    story = []
+    story.append(Paragraph(st.session_state.get("school_name", "School"), title_style))
+    story.append(Paragraph("System Backup Summary", subtitle_style))
+    story.append(Paragraph(
+        f"Generated: {datetime.now().strftime('%d %B %Y at %H:%M')}",
+        subtitle_style
+    ))
+    story.append(Spacer(1, 20))
+
+    # ---- Summary table ----
+    summary_data = [["Role", "Count"]]
+    total = 0
+    labels = {
+        "admin": "Administrators",
+        "teacher": "Teachers",
+        "student": "Students",
+        "parent": "Parents",
+        "clerk": "Clerks",
+        "exams": "Exams Officers",
+        "it_officer": "IT Officers",
+    }
+    for key, label in labels.items():
+        count = len(groups[key])
+        summary_data.append([label, str(count)])
+        total += count
+    summary_data.append(["TOTAL", str(total)])
+
+    t = Table(summary_data, colWidths=[200, 100])
+    t.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#263238")),
+        ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+        ("FONTNAME", (0, -1), (-1, -1), "Helvetica-Bold"),
+        ("BACKGROUND", (0, -1), (-1, -1), colors.HexColor("#edf1f3")),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c9d0d6")),
+        ("ALIGN", (1, 0), (1, -1), "CENTER"),
+        ("PADDING", (0, 0), (-1, -1), 6),
+    ]))
+    story.append(t)
+
+    # ---- Account lists ----
+    for key, label in labels.items():
+        items = sorted(groups[key], key=lambda x: x.get("student_name") or "")
+        if not items:
+            continue
+        story.append(Paragraph(f"{label} ({len(items)})", section_style))
+        data = [["Full Name", "Username"]]
+        for r in items:
+            data.append([
+                Paragraph(str(r.get("student_name") or ""), cell_style),
+                Paragraph(str(r.get("username") or ""), cell_style),
+            ])
+        tbl = Table(data, colWidths=[280, 180], repeatRows=1)
+        tbl.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#455a64")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 8),
+            ("GRID", (0, 0), (-1, -1), 0.3, colors.HexColor("#d7dce0")),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f7f9fa")]),
+            ("PADDING", (0, 0), (-1, -1), 4),
+        ]))
+        story.append(tbl)
+
+    story.append(Spacer(1, 20))
+    story.append(Paragraph("_____________________________", cell_style))
+    story.append(Paragraph("Received by (Principal / Deputy) & Date", cell_style))
+
+    doc.build(story)
+    buf.seek(0)
+    return buf.getvalue()
 def create_backup_zip():
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
@@ -6687,8 +7225,7 @@ elif page == "🤖 AI Advisor":
 
 elif page == "Settings":
     st.subheader("School Profile & System Settings")
-
-    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_exams, tab_admins, tab_tt_setup, tab_ito, tab_backup, tab_health = st.tabs([
+    tab_profile, tab_password, tab_teachers, tab_clerks, tab_parents, tab_students, tab_format, tab_exams, tab_admins, tab_tt_setup, tab_ito, tab_backup, tab_bulk, tab_health = st.tabs([
         "🏫 School Profile",
         "🔒 Change Password",
         "👨‍🏫 Teacher Accounts",
@@ -6701,6 +7238,7 @@ elif page == "Settings":
         "⚙️ Timetable Setup",
         "🖥️ IT Officer Accounts",
         "💾 Backup & Data",
+        "📥 Bulk Import",
         "🖥️ System Health"
     ])
 
@@ -7638,6 +8176,66 @@ For **every term**, the app expects 3 types of columns:
         else:
             st.write("### Download a full backup")
             st.caption("ZIP with all cloud tables as JSON files.")
+            st.divider()
+            st.markdown("### 📦 Download Full Backup (3 files)")
+
+            st.info(
+                "**How to use these files:**\n"
+                "- **📊 Excel** — share with the principal. Contains names, usernames, roles. No passwords.\n"
+                "- **🔒 Passwords CSV** — keep offline in a safe. Do not email.\n"
+                "- **🖨️ PDF** — print and file. Contains account list for the school records."
+            )
+
+            col1, col2, col3 = st.columns(3)
+
+            with col1:
+                if st.button("📊 Prepare Excel Backup", type="primary", use_container_width=True, key="bk_excel_btn"):
+                    try:
+                        with st.spinner("Building Excel..."):
+                            xlsx = _backup_excel_bytes()
+                        st.download_button(
+                            "⬇️ Download Excel",
+                            data=xlsx,
+                            file_name=f"Backup_{st.session_state.school_name.replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.xlsx",
+                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            use_container_width=True,
+                            key="bk_excel_dl"
+                        )
+                    except Exception as e:
+                        st.error(f"Excel error: {e}")
+
+            with col2:
+                if st.button("🔒 Prepare Passwords CSV", use_container_width=True, key="bk_pw_btn"):
+                    try:
+                        with st.spinner("Building CSV..."):
+                            csv_bytes = _backup_passwords_csv_bytes()
+                        st.download_button(
+                            "⬇️ Download Passwords",
+                            data=csv_bytes,
+                            file_name=f"Passwords_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            use_container_width=True,
+                            key="bk_pw_dl"
+                        )
+                        st.warning("⚠️ Keep this file offline. Do not email.")
+                    except Exception as e:
+                        st.error(f"CSV error: {e}")
+
+            with col3:
+                if st.button("🖨️ Prepare Summary PDF", use_container_width=True, key="bk_pdf_btn"):
+                    try:
+                        with st.spinner("Building PDF..."):
+                            pdf_bytes = _backup_summary_pdf_bytes()
+                        st.download_button(
+                            "⬇️ Download PDF",
+                            data=pdf_bytes,
+                            file_name=f"Summary_{st.session_state.school_name.replace(' ','_')}_{datetime.now().strftime('%Y%m%d')}.pdf",
+                            mime="application/pdf",
+                            use_container_width=True,
+                            key="bk_pdf_dl"
+                        )
+                    except Exception as e:
+                        st.error(f"PDF error: {e}")
             
 
             st.divider()
@@ -7648,7 +8246,7 @@ For **every term**, the app expects 3 types of columns:
                 st.write(f"**Students:** {len(df)}")
                 st.write(f"**Streams:** {df[stream_col].nunique()}")
 
-            st.success("✅ All data is stored in Supabase — it persists across app restarts.")
+            
 
         # ============================================================
     # TAB 11.5: IT Officer Accounts (admin-only)
@@ -7820,31 +8418,247 @@ For **every term**, the app expects 3 types of columns:
             st.write(f"**School:** {st.session_state.school_name}")
             st.write(f"**Academic Year:** {st.session_state.get('academic_year', '')}")
             st.write(f"**Current Term:** {st.session_state.get('current_term', '')}")
+                # ============================================================
+    # TAB 14: Bulk Import
+    # ============================================================
+    with tab_bulk:
+        if st.session_state.user_role not in ["admin", "exams"]:
+            st.info("🔒 Only administrators and examination officers can bulk-import accounts.")
+        else:
+            st.subheader("📥 Bulk Import Accounts")
+            st.caption(
+                "Upload an Excel file to create accounts in bulk. "
+                "Passwords are auto-generated and shown once after import."
+            )
 
-            if db_ok:
-                st.success("✅ All systems operational.")
-            else:
-                st.error("⚠️ Database is unreachable. Contact the developer immediately.")
-
-            st.write("### Download a full backup")
-            st.caption("ZIP with all cloud tables as JSON files.")
-            if st.button("Prepare Backup ZIP", type="primary", use_container_width=True, key="backup_prepare_btn"):
-                with st.spinner("Packaging backup..."):
-                    backup = create_backup_zip()
-                st.download_button(
-                    "⬇️ Download Backup ZIP",
-                    data=backup.getvalue(),
-                    file_name=f"Academic_System_Backup_{datetime.now().strftime('%Y%m%d_%H%M')}.zip",
-                    mime="application/zip",
-                    use_container_width=True
+            import_tab_teachers, import_tab_subjects, import_tab_classes, import_tab_periods, import_tab_students, import_tab_parents = st.tabs([
+                "👨‍🏫 Teachers",
+                "📖 Subjects",
+                "🏫 Classes",
+                "🕐 Periods",
+                "🎓 Students",
+                "👨‍👩‍👧 Parents",
+            ])
+                        # ---------- TEACHERS ----------
+            with import_tab_teachers:
+                st.markdown("### Upload Teachers")
+                st.caption(
+                    "Excel columns: **Full Name** (required) · **Subjects** (optional, comma-sep) · "
+                    "**Classes** (optional, pipe-sep). Creates a login account, a timetable teacher row, "
+                    "and class assignments — all in one import."
                 )
+                teacher_file = st.file_uploader(
+                    "Teachers Excel",
+                    type=["xlsx", "xls"],
+                    key="bulk_teacher_file",
+                )
+                if teacher_file is not None:
+                    try:
+                        df_t = pd.read_excel(teacher_file)
+                        df_t.columns = [str(c).strip().lower() for c in df_t.columns]
+                        name_col_t = None
+                        for c in df_t.columns:
+                            if c in ["full name", "name", "teacher name", "full_name"]:
+                                name_col_t = c
+                                break
+                        if name_col_t is None:
+                            st.error("Could not find a name column. Use 'Full Name' or 'Name'.")
+                        else:
+                            if name_col_t != "full name":
+                                df_t = df_t.rename(columns={name_col_t: "full name"})
 
-            st.divider()
-            st.write("### Current data")
-            st.write(f"**File:** {st.session_state.raw_file_name or 'No file loaded'}")
-            if data is not None:
-                st.write(f"**Analysis term:** {data['analysis_term'].upper()}")
-                st.write(f"**Students:** {len(df)}")
-                st.write(f"**Streams:** {df[stream_col].nunique()}")
+                            st.write(f"**Detected {len(df_t)} rows.** Preview:")
+                            st.dataframe(df_t.head(5), use_container_width=True, hide_index=True)
 
+                            if st.button("🚀 Import Teachers", type="primary", key="bulk_import_teachers_btn"):
+                                with st.spinner("Creating teacher accounts + timetable rows + assignments..."):
+                                    result = _bulk_import_teachers_full(df_t)
+
+                                st.success(f"✅ Created {len(result['created'])} teacher accounts.")
+                                if result["skipped"]:
+                                    st.warning(f"⚠️ Skipped {len(result['skipped'])} rows.")
+                                if result["errors"]:
+                                    st.error(f"❌ {len(result['errors'])} rows had errors.")
+
+                                if result["created"]:
+                                    csv_bytes = _credentials_csv(result["created"])
+                                    st.download_button(
+                                        "⬇️ Download Credentials CSV",
+                                        data=csv_bytes,
+                                        file_name=f"Teacher_Credentials_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                                        mime="text/csv",
+                                        key="bulk_teacher_csv_dl",
+                                    )
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+
+                        # ---------- SUBJECTS ----------
+            with import_tab_subjects:
+                st.markdown("### Upload Subjects")
+                st.caption(
+                    "Excel columns: **Subject** · **Periods Per Week** · "
+                    "**Has Double** (yes/no) · **Requires Lab** (yes/no) · **Lab Type**"
+                )
+                subject_file = st.file_uploader("Subjects Excel", type=["xlsx", "xls"], key="bulk_subject_file")
+                if subject_file is not None:
+                    try:
+                        df_sub = pd.read_excel(subject_file)
+                        df_sub.columns = [str(c).strip().lower() for c in df_sub.columns]
+                        st.write(f"**Detected {len(df_sub)} rows.** Preview:")
+                        st.dataframe(df_sub.head(5), use_container_width=True, hide_index=True)
+
+                        if st.button("🚀 Import Subjects", type="primary", key="bulk_import_subjects_btn"):
+                            with st.spinner("Creating subjects..."):
+                                result = _bulk_import_subjects(df_sub)
+                            st.success(f"✅ Imported {len(result['created'])} subjects.")
+                            if result["errors"]:
+                                st.error(f"❌ {len(result['errors'])} rows had errors.")
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+
+            # ---------- CLASSES ----------
+            with import_tab_classes:
+                st.markdown("### Upload Classes")
+                st.caption("Excel columns: **Class Name**")
+                class_file = st.file_uploader("Classes Excel", type=["xlsx", "xls"], key="bulk_class_file")
+                if class_file is not None:
+                    try:
+                        df_cls = pd.read_excel(class_file)
+                        df_cls.columns = [str(c).strip().lower() for c in df_cls.columns]
+                        st.write(f"**Detected {len(df_cls)} rows.** Preview:")
+                        st.dataframe(df_cls.head(5), use_container_width=True, hide_index=True)
+
+                        if st.button("🚀 Import Classes", type="primary", key="bulk_import_classes_btn"):
+                            with st.spinner("Creating classes..."):
+                                result = _bulk_import_classes(df_cls)
+                            st.success(f"✅ Imported {len(result['created'])} classes.")
+                            if result["errors"]:
+                                st.error(f"❌ {len(result['errors'])} rows had errors.")
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+
+            # ---------- PERIODS ----------
+            with import_tab_periods:
+                st.markdown("### Upload Periods")
+                st.caption("Excel columns: **Period No** · **Start Time** · **End Time**")
+                period_file = st.file_uploader("Periods Excel", type=["xlsx", "xls"], key="bulk_period_file")
+                if period_file is not None:
+                    try:
+                        df_per = pd.read_excel(period_file)
+                        df_per.columns = [str(c).strip().lower() for c in df_per.columns]
+                        st.write(f"**Detected {len(df_per)} rows.** Preview:")
+                        st.dataframe(df_per.head(5), use_container_width=True, hide_index=True)
+
+                        if st.button("🚀 Import Periods", type="primary", key="bulk_import_periods_btn"):
+                            with st.spinner("Creating periods..."):
+                                result = _bulk_import_periods(df_per)
+                            st.success(f"✅ Imported {len(result['created'])} periods.")
+                            if result["errors"]:
+                                st.error(f"❌ {len(result['errors'])} rows had errors.")
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+
+                        # ---------- STUDENTS ----------
+            with import_tab_students:
+                st.markdown("### Upload Students")
+                st.caption(
+                    "Excel columns: **Full Name** (required) · **Stream** (optional) · "
+                    "**Username** (optional) · **Password** (optional)"
+                )
+                student_file = st.file_uploader(
+                    "Students Excel",
+                    type=["xlsx", "xls"],
+                    key="bulk_student_file",
+                )
+                if student_file is not None:
+                    try:
+                        df_s = pd.read_excel(student_file)
+                        df_s.columns = [str(c).strip().lower() for c in df_s.columns]
+                        name_col_s = None
+                        for c in df_s.columns:
+                            if c in ["full name", "name", "student name", "full_name"]:
+                                name_col_s = c
+                                break
+                        if name_col_s is None:
+                            st.error("Could not find a name column. Use 'Full Name' or 'Name'.")
+                        else:
+                            if name_col_s != "full name":
+                                df_s = df_s.rename(columns={name_col_s: "full name"})
+
+                            st.write(f"**Detected {len(df_s)} rows.** Preview:")
+                            st.dataframe(df_s.head(5), use_container_width=True, hide_index=True)
+
+                            if st.button("🚀 Import Students", type="primary", key="bulk_import_students_btn"):
+                                with st.spinner("Creating student accounts..."):
+                                    result = _bulk_import_users(df_s, "student", "full name")
+
+                                st.success(f"✅ Created {len(result['created'])} student accounts.")
+                                if result["skipped"]:
+                                    st.warning(f"⚠️ Skipped {len(result['skipped'])} rows.")
+                                if result["errors"]:
+                                    st.error(f"❌ {len(result['errors'])} rows had errors.")
+
+                                if result["created"]:
+                                    csv_bytes = _credentials_csv(result["created"])
+                                    st.download_button(
+                                        "⬇️ Download Credentials CSV",
+                                        data=csv_bytes,
+                                        file_name=f"Student_Credentials_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                                        mime="text/csv",
+                                        key="bulk_student_csv_dl",
+                                    )
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
+
+            # ---------- PARENTS ----------
+            with import_tab_parents:
+                st.markdown("### Upload Parents")
+                st.caption(
+                    "Excel columns: **Full Name** (required) · **Children** (optional, pipe-separated) · "
+                    "**Username** (optional) · **Password** (optional)"
+                )
+                parent_file = st.file_uploader(
+                    "Parents Excel",
+                    type=["xlsx", "xls"],
+                    key="bulk_parent_file",
+                )
+                if parent_file is not None:
+                    try:
+                        df_p = pd.read_excel(parent_file)
+                        df_p.columns = [str(c).strip().lower() for c in df_p.columns]
+                        name_col_p = None
+                        for c in df_p.columns:
+                            if c in ["full name", "name", "parent name", "full_name", "guardian name"]:
+                                name_col_p = c
+                                break
+                        if name_col_p is None:
+                            st.error("Could not find a name column. Use 'Full Name' or 'Name'.")
+                        else:
+                            if name_col_p != "full name":
+                                df_p = df_p.rename(columns={name_col_p: "full name"})
+
+                            st.write(f"**Detected {len(df_p)} rows.** Preview:")
+                            st.dataframe(df_p.head(5), use_container_width=True, hide_index=True)
+
+                            if st.button("🚀 Import Parents", type="primary", key="bulk_import_parents_btn"):
+                                with st.spinner("Creating parent accounts..."):
+                                    result = _bulk_import_users(df_p, "parent", "full name")
+
+                                st.success(f"✅ Created {len(result['created'])} parent accounts.")
+                                if result["skipped"]:
+                                    st.warning(f"⚠️ Skipped {len(result['skipped'])} rows.")
+                                if result["errors"]:
+                                    st.error(f"❌ {len(result['errors'])} rows had errors.")
+
+                                if result["created"]:
+                                    csv_bytes = _credentials_csv(result["created"])
+                                    st.download_button(
+                                        "⬇️ Download Credentials CSV",
+                                        data=csv_bytes,
+                                        file_name=f"Parent_Credentials_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+                                        mime="text/csv",
+                                        key="bulk_parent_csv_dl",
+                                    )
+                    except Exception as e:
+                        st.error(f"Error reading file: {e}")
             st.success("✅ All data is stored in Supabase — it persists across app restarts.")
